@@ -38,8 +38,8 @@ Use the SPI through-hole test points next to J1 (or J1 itself).
 
 | EVM input | Voltage | Source | Note |
 |---|---|---|---|
-| V+ | +15V nominal | bench supply | turret post; ±15V required for the ±10V SoftSpan range |
-| V− | −15V nominal | bench supply | turret post |
+| V+ | +15V nominal | bench supply | turret post; supplies the output stage with headroom above the 10V full scale |
+| V− | −15V nominal | bench supply | turret post; needed for bipolar spans, and fine to leave connected on the 0–10V span in use |
 | OVP | 5V (1.71–5.5V) | Arduino Mega 5V pin | sets SPI logic level; SPI is dead without it |
 | AVP | — | onboard LT1761-5 from V+ | no external connection needed |
 | GND | 0V | common | bench supply, EVM, and Mega grounds tied together |
@@ -47,20 +47,41 @@ Use the SPI through-hole test points next to J1 (or J1 itself).
 The regulators themselves need a separate **24 VDC** supply (the DAC only
 provides their 0–10V command signal).
 
-Jumper configuration (as set on our board — this is the factory default):
+Jumper configuration as set on our board — note this is **not** SoftSpan:
 
 | Jumper | Function | Setting |
 |---|---|---|
 | JP1 | REF_SEL | **INT** (internal 2.5V reference) |
-| JP2 | MSP0 | **1** |
-| JP3 | MSP1 | **1** |
-| JP4 | MSP2 | **1** |
+| JP2 | MSP0 | 1 |
+| JP3 | MSP1 | 1 |
+| JP4 | MSP2 | **0** |
 
-MSP0/1/2 = 1/1/1 selects **SoftSpan mode**: powers up in the 0–5V span at
-zero-scale (0V). The firmware then switches all channels to ±10V span and
-0V output at boot. Do not change these jumpers — any other MSP setting
-locks the part into a fixed manual span and the firmware's span commands
-would be ignored.
+Only JP4 has been re-checked against the physical board; JP1–JP3 are as
+originally recorded.
+
+Because MSP2 = 0, the MSPx pins are **not** all 1, so the part is not in
+SoftSpan mode — it is locked into a fixed manual span, and SPI span
+commands are accepted but have no effect on the hardware.
+
+The span actually in force was established by measurement rather than by
+decoding the jumpers: with the firmware assuming ±10V, a commanded 5V
+measured **7.5V** at VOUT0. That is code 49151 read across a 10V window,
+which is only consistent with a **0–10V** span — every other span gives a
+different voltage (0–5V → 3.75, ±5V → 2.50, ±2.5V → 1.25).
+
+That span is the correct one for this system regardless: both regulator
+models take a 0–10V command signal, so ±10V would have spent half the
+code range on voltages they cannot use. The firmware programs
+`LTC2668_SPAN_0_TO_10V` in `setup()`, which keeps the driver's code
+conversion correct in either mode — ignored in fixed mode (where the span
+already is 0–10V), applied in SoftSpan.
+
+**Watch out for this:** in fixed mode the `SPAN` command still updates the
+driver's conversion math while the hardware stays put, which reproduces
+exactly the wrong-voltage bug above. `DUMP` reports the driver's span per
+channel so a mismatch is visible. Setting JP4 to 1 puts the part in
+SoftSpan and makes the firmware authoritative; nothing else changes,
+since it already asks for 0–10V.
 
 ### DAC channel assignment
 
@@ -70,7 +91,7 @@ would be ignored.
 | 1 | VOUT1 | SMC ITV2090-312L5 (vacuum) | `VAC1` | −1.3 … −80 kPa |
 | 2 | VOUT2 | SMC ITV2090-312L5 (vacuum) | `VAC2` | −1.3 … −80 kPa |
 | 3 | VOUT3 | SMC ITV2090-312L5 (vacuum) | `VAC3` | −1.3 … −80 kPa |
-| 4–15 | VOUT4–15 | spare | — | raw ±10V via `V <ch> <volts>` |
+| 4–15 | VOUT4–15 | spare | — | raw 0–10V via `V <ch> <volts>` |
 
 Regulator index in the `P` command equals the DAC channel number. The
 mapping lives in the `RegulatorConfig` table in
@@ -87,17 +108,34 @@ pio device monitor      # 115200 baud, expect: "OK SRFM-DAC v1.0 ready"
 
 ## Serial protocol (115200, one command per line)
 
+Pressure layer — normal operation:
+
 | Command | Meaning | Reply |
 |---|---|---|
 | `ID` | identify | `OK SRFM-DAC v1.0` |
-| `P <reg 0-3> <pressure>` | set regulator pressure (eng. units) | `OK AIR p=50.00 v=5.000` |
-| `V <ch 0-15> <volts>` | raw DAC voltage, −10…+10 | `OK ch4 v=-2.500` |
+| `P <reg 0-3> <pressure>` | set regulator pressure (eng. units) | `OK AIR p=100.00 v=1.984` |
 | `CAL <reg> <vMin> <vMax> <pMin> <pMax>` | set regulator calibration | `OK cal set` |
 | `GET` | status of all 4 regulators | `OK AIR=0.00,0.000V; VAC1=…` |
 | `ZERO` | everything to 0 / safe state | `OK all zero` |
 
+Raw DAC layer — bring-up and debugging, bypasses the pressure mapping:
+
+| Command | Meaning | Reply |
+|---|---|---|
+| `V <ch 0-15> <volts>` | set a channel to a voltage in its span | `OK ch0 v=5.000 code=32767` |
+| `C <ch 0-15> <code 0-65535>` | write a raw 16-bit DAC code | `OK ch0 code=16384 v=2.500` |
+| `SPAN <span>` | set span on all channels | `OK span=1 range=0.00..10.00V on all channels` |
+| `SPAN <ch> <span>` | set span on one channel | as above, `on ch0` |
+| `DUMP` | code, voltage and span for all 16 channels | `OK ch0=16384,2.500V,s1; …` |
+| `VERIFY` | SDO readback health (needs MISO on pin 50) | `OK verify=yes` |
+
+Span codes: `0`=0–5V, `1`=0–10V, `2`=±5V, `3`=±10V, `4`=±2.5V. See the
+jumper section above — `SPAN` only reaches the hardware in SoftSpan mode.
+
 Setpoints are clamped to the calibrated range; the reply always shows what
-was actually applied.
+was actually applied. `GET` and `DUMP` report the DAC's own record of the
+last code written, so a raw `V` or `C` on a regulator channel is reflected
+honestly rather than hidden behind a stale pressure setpoint.
 
 ## Calibration
 
