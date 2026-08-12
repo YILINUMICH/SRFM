@@ -34,8 +34,18 @@ Use the SPI through-hole test points next to J1 (or J1 itself).
 | 5V | **OVP** | required — powers the EVM's digital interface at Arduino logic level |
 | GND | GND | common ground |
 
-Analog supply (bench supply): **V+ = +15V, V− = −15V, GND** on the EVM turret
-posts. ±15V is required for the ±10V SoftSpan range.
+### Supply inputs
+
+| EVM input | Voltage | Source | Note |
+|---|---|---|---|
+| V+ | +15V nominal | bench supply | turret post; ±15V required for the ±10V SoftSpan range |
+| V− | −15V nominal | bench supply | turret post |
+| OVP | 5V (1.71–5.5V) | Arduino Mega 5V pin | sets SPI logic level; SPI is dead without it |
+| AVP | — | onboard LT1761-5 from V+ | no external connection needed |
+| GND | 0V | common | bench supply, EVM, and Mega grounds tied together |
+
+The regulators themselves need a separate **24 VDC** supply (the DAC only
+provides their 0–10V command signal).
 
 Jumper configuration (as set on our board — this is the factory default):
 
@@ -52,8 +62,20 @@ zero-scale (0V). The firmware then switches all channels to ±10V span and
 locks the part into a fixed manual span and the firmware's span commands
 would be ignored.
 
-Regulator command inputs connect to **VOUT0–VOUT3** (+ their grounds):
-VOUT0 = air pressure, VOUT1–3 = vacuum.
+### DAC channel assignment
+
+| DAC ch | EVM output | Regulator | Firmware name | 0–10V maps to |
+|---|---|---|---|---|
+| 0 | VOUT0 | SMC ITV0030-3BL (air pressure) | `AIR` | +1 … +500 kPa |
+| 1 | VOUT1 | SMC ITV2090-312L5 (vacuum) | `VAC1` | −1.3 … −80 kPa |
+| 2 | VOUT2 | SMC ITV2090-312L5 (vacuum) | `VAC2` | −1.3 … −80 kPa |
+| 3 | VOUT3 | SMC ITV2090-312L5 (vacuum) | `VAC3` | −1.3 … −80 kPa |
+| 4–15 | VOUT4–15 | spare | — | raw ±10V via `V <ch> <volts>` |
+
+Regulator index in the `P` command equals the DAC channel number. The
+mapping lives in the `RegulatorConfig` table in
+`lib/PressureControl/PressureControl.h` (`dacChannel` field) — change it
+there if the wiring changes.
 
 ## Build & flash
 
