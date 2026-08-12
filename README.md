@@ -159,6 +159,52 @@ pip install -r requirements.txt
 python3 gui/pressure_gui.py
 ```
 
-Pick the Mega's port (`usbmodem…` on macOS), Connect (waits ~2.5s for the
-auto-reset), then use the sliders/entries. `ZERO ALL` is the panic button;
-the GUI also sends `ZERO` on window close.
+Pick the Mega's port (`COM…` on Windows, `usbmodem…` on macOS), Connect
+(waits ~2.5s for the auto-reset), then drive each regulator from its preset
+buttons or its manual entries. Preset buttons are labelled with both the
+pressure and the command voltage the firmware will program. Each panel also
+takes a raw voltage, sending `V <ch> <volts>` for debugging.
+
+`ZERO ALL` is the panic button; the GUI also sends `ZERO` on window close.
+
+### Test profiles
+
+**Script…** runs an unattended sequence of held setpoints from a JSON file,
+for long-duration testing. Profiles live in `gui/profiles/`; two are
+included — `quick_check.json` (~1 min, exercises both the pressure and raw
+voltage paths) and `vacuum_soak.json` (~1h45m, 4 loops).
+
+```json
+{
+  "name": "vacuum soak",
+  "loops": 2,
+  "zero_on_finish": true,
+  "steps": [
+    {"label": "pressurise", "hold_s": 30,  "set": [{"reg": 0, "kPa": 100}]},
+    {"label": "soak",       "hold_s": 600, "set": [{"reg": 1, "kPa": -40}]},
+    {"label": "hold as-is", "hold_s": 15,  "set": []},
+    {"label": "spare ch",   "hold_s": 10,  "set": [{"ch": 4, "volts": 2.5}]}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | shown in the progress line; defaults to the filename |
+| `loops` | repeat count for the whole step list, default 1 |
+| `zero_on_finish` | send `ZERO` when the run ends or is stopped, default true |
+| `steps[].label` | shown in the progress line and the log |
+| `steps[].hold_s` | how long to hold this step, seconds |
+| `steps[].set` | setpoints applied at the start of the step |
+
+A `set` entry is either `{"reg": 0-3, "kPa": <pressure>}` for the pressure
+layer or `{"ch": 0-15, "volts": <volts>}` to drive a DAC channel directly.
+An empty `set` holds whatever the previous step left in place.
+
+The whole file is validated before the run starts — including every
+setpoint against that regulator's calibrated range — so a typo is caught up
+front rather than eight hours in. Manual controls lock while a profile runs;
+**Stop** ends it within a quarter second and zeroes the outputs. Holds are
+timed against monotonic deadlines rather than by counting ticks, so a long
+soak will not drift, and the run is driven from Tk's event loop rather than
+a thread, so nothing else contends for the serial port.

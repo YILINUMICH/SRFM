@@ -7,10 +7,13 @@ Talks to the Arduino Mega + LTC2668 firmware over USB serial
 Requires: pyserial  (pip install -r requirements.txt)
 """
 
+import json
+import os
 import queue
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 import serial
 import serial.tools.list_ports
@@ -51,6 +54,137 @@ def is_partial_number(text):
     a value like -12.5.
     """
     return text in ("", "-", ".", "-.", "+") or to_float(text) is not None
+
+
+def fmt_hms(seconds):
+    """Seconds as m:ss, or h:mm:ss once past an hour."""
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+# --- test profiles -------------------------------------------------------
+#
+# A profile is a JSON file describing a sequence of held setpoints, so a long
+# unattended run can be defined once and replayed. Format:
+#
+#   {
+#     "name": "vacuum soak",
+#     "loops": 2,                     optional, default 1
+#     "zero_on_finish": true,         optional, default true
+#     "steps": [
+#       {"label": "pressurise", "hold_s": 30,
+#        "set": [{"reg": 0, "kPa": 100}]},
+#       {"label": "soak",       "hold_s": 600,
+#        "set": [{"reg": 0, "kPa": 100}, {"reg": 1, "kPa": -40}]},
+#       {"label": "vent",       "hold_s": 15, "set": []}
+#     ]
+#   }
+#
+# A "set" entry is either {"reg": 0-3, "kPa": <pressure>} for the pressure
+# layer, or {"ch": 0-15, "volts": <volts>} to drive a DAC channel directly.
+# An empty "set" holds whatever the previous step left in place.
+
+PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
+
+
+def _require_number(value, where, field):
+    """Return value as a float, or raise naming the offending field.
+
+    bool is excluded deliberately: it subclasses int, and a JSON true is not
+    a setpoint.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: '{field}' must be a number")
+    return float(value)
+
+
+def _validate_step(step, i):
+    where = f"step {i + 1}"
+    if not isinstance(step, dict):
+        raise ValueError(f"{where}: must be a JSON object")
+
+    hold = _require_number(step.get("hold_s"), where, "hold_s")
+    if hold <= 0:
+        raise ValueError(f"{where}: 'hold_s' must be greater than zero seconds")
+
+    raw_actions = step.get("set", [])
+    if not isinstance(raw_actions, list):
+        raise ValueError(f"{where}: 'set' must be a list")
+
+    actions = []
+    for entry in raw_actions:
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where}: every 'set' entry must be a JSON object")
+
+        if "reg" in entry:
+            reg = entry["reg"]
+            if not isinstance(reg, int) or isinstance(reg, bool) \
+                    or not 0 <= reg < len(REGULATORS):
+                raise ValueError(f"{where}: 'reg' must be 0..{len(REGULATORS) - 1}")
+            value = _require_number(entry.get("kPa"), where, "kPa")
+            _, p_at_0v, p_at_10v, unit, _ = REGULATORS[reg]
+            lo, hi = min(p_at_0v, p_at_10v), max(p_at_0v, p_at_10v)
+            if not lo <= value <= hi:
+                raise ValueError(
+                    f"{where}: {value:g} {unit} is outside regulator {reg}'s "
+                    f"range of {lo:g} .. {hi:g} {unit}")
+            actions.append(("P", reg, value))
+
+        elif "ch" in entry:
+            channel = entry["ch"]
+            if not isinstance(channel, int) or isinstance(channel, bool) \
+                    or not 0 <= channel <= 15:
+                raise ValueError(f"{where}: 'ch' must be 0..15")
+            value = _require_number(entry.get("volts"), where, "volts")
+            if not VOLT_MIN <= value <= VOLT_MAX:
+                raise ValueError(
+                    f"{where}: {value:g} V is outside {VOLT_MIN:g} .. {VOLT_MAX:g} V")
+            actions.append(("V", channel, value))
+
+        else:
+            raise ValueError(f"{where}: a 'set' entry needs either 'reg' or 'ch'")
+
+    return {
+        "label": str(step.get("label") or f"step {i + 1}"),
+        "hold_s": float(hold),
+        "actions": actions,
+    }
+
+
+def load_profile(path):
+    """Read and validate a test profile.
+
+    Everything is checked up front — setpoints included — so a typo is caught
+    before the run starts rather than eight hours in.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        try:
+            raw = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"not valid JSON: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError("the top level must be a JSON object")
+
+    raw_steps = raw.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("'steps' must be a non-empty list")
+
+    loops = raw.get("loops", 1)
+    if not isinstance(loops, int) or isinstance(loops, bool) or loops < 1:
+        raise ValueError("'loops' must be a whole number of 1 or more")
+
+    steps = [_validate_step(step, i) for i, step in enumerate(raw_steps)]
+
+    return {
+        "name": str(raw.get("name") or os.path.basename(path)),
+        "loops": loops,
+        "steps": steps,
+        "zero_on_finish": bool(raw.get("zero_on_finish", True)),
+        "duration_s": sum(step["hold_s"] for step in steps) * loops,
+    }
 
 
 class SerialLink:
@@ -124,12 +258,15 @@ class RegulatorPanel(ttk.LabelFrame):
             row=1, column=0, padx=(10, 6), pady=2, sticky="w")
         preset_bar = ttk.Frame(self)
         preset_bar.grid(row=1, column=1, columnspan=3, padx=(0, 10), pady=2, sticky="w")
+        self.controls = []
         for value in presets:
-            ttk.Button(preset_bar,
-                       text=f"{value:g} {unit}\n{self.voltage_for(value):.2f} V",
-                       width=9,
-                       command=lambda v=value: self.apply_pressure(v)).pack(
-                           side="left", padx=2)
+            button = ttk.Button(
+                preset_bar,
+                text=f"{value:g} {unit}\n{self.voltage_for(value):.2f} V",
+                width=9,
+                command=lambda v=value: self.apply_pressure(v))
+            button.pack(side="left", padx=2)
+            self.controls.append(button)
 
         # --- manual pressure entry ---
         ttk.Label(self, text="Pressure").grid(
@@ -140,9 +277,10 @@ class RegulatorPanel(ttk.LabelFrame):
         self.p_entry.grid(row=2, column=1, pady=2, sticky="w")
         self.p_entry.bind("<Return>", lambda _e: self.apply_pressure_entry())
         ttk.Label(self, text=unit, width=4).grid(row=2, column=2, padx=(6, 0), sticky="w")
-        ttk.Button(self, text="Set", width=7,
-                   command=self.apply_pressure_entry).grid(
-                       row=2, column=3, padx=(4, 10), sticky="w")
+        p_button = ttk.Button(self, text="Set", width=7,
+                              command=self.apply_pressure_entry)
+        p_button.grid(row=2, column=3, padx=(4, 10), sticky="w")
+        self.controls += [self.p_entry, p_button]
 
         # --- manual voltage entry (bypasses the pressure mapping) ---
         ttk.Label(self, text="Voltage").grid(
@@ -153,9 +291,10 @@ class RegulatorPanel(ttk.LabelFrame):
         self.v_entry.grid(row=3, column=1, pady=2, sticky="w")
         self.v_entry.bind("<Return>", lambda _e: self.apply_voltage_entry())
         ttk.Label(self, text="V", width=4).grid(row=3, column=2, padx=(6, 0), sticky="w")
-        ttk.Button(self, text="Set V", width=7,
-                   command=self.apply_voltage_entry).grid(
-                       row=3, column=3, padx=(4, 10), sticky="w")
+        v_button = ttk.Button(self, text="Set V", width=7,
+                              command=self.apply_voltage_entry)
+        v_button.grid(row=3, column=3, padx=(4, 10), sticky="w")
+        self.controls += [self.v_entry, v_button]
 
         self.readback = ttk.Label(self, text="commanded    —", foreground="#444")
         self.readback.grid(row=4, column=0, columnspan=4, padx=10, pady=(6, 2),
@@ -213,6 +352,12 @@ class RegulatorPanel(ttk.LabelFrame):
         self.v_entry.insert(0, f"{value:.3f}")
         self.on_set_voltage(self.index, value)
 
+    def set_enabled(self, enabled):
+        """Lock the manual controls while a profile is driving this channel."""
+        state = "normal" if enabled else "disabled"
+        for widget in self.controls:
+            widget.config(state=state)
+
     def reset_fields(self):
         self.p_entry.delete(0, "end")
         self.p_entry.insert(0, "0.0")
@@ -225,6 +370,87 @@ class RegulatorPanel(ttk.LabelFrame):
             text=f"commanded    {pressure} {self.unit}        DAC    {volts} V")
 
 
+class ProfileRunner:
+    """Steps a profile through the firmware without blocking the UI.
+
+    Driven from Tk's after() queue rather than a thread or a sleep loop, so a
+    multi-hour run stays responsive, Stop takes effect within one tick, and
+    there is no second thread contending for the serial port.
+
+    Holds are timed against time.monotonic() deadlines rather than by counting
+    ticks, so a slow redraw or a busy machine cannot make a long soak drift.
+    """
+
+    TICK_MS = 250
+
+    def __init__(self, app, profile):
+        self.app = app
+        self.profile = profile
+        self.steps = profile["steps"]
+        self.loop = 1
+        self.index = -1
+        self.deadline = 0.0
+        self.job = None
+        self.running = False
+
+    def start(self):
+        self.running = True
+        self.app.log_line(
+            f"# profile '{self.profile['name']}' started — "
+            f"{len(self.steps)} steps x {self.profile['loops']} "
+            f"= {fmt_hms(self.profile['duration_s'])}")
+        self._next_step()
+
+    def stop(self, reason):
+        if not self.running:
+            return
+        self.running = False
+        if self.job is not None:
+            self.app.after_cancel(self.job)
+            self.job = None
+        self.app.log_line(f"# profile {reason}")
+        if self.profile["zero_on_finish"]:
+            self.app.zero_all()
+        self.app.on_profile_finished()
+
+    def _next_step(self):
+        self.index += 1
+        if self.index >= len(self.steps):
+            if self.loop >= self.profile["loops"]:
+                self.stop("finished")
+                return
+            self.loop += 1
+            self.index = 0
+
+        step = self.steps[self.index]
+        self.app.log_line(
+            f"# loop {self.loop}/{self.profile['loops']} "
+            f"step {self.index + 1}/{len(self.steps)} "
+            f"'{step['label']}' — hold {fmt_hms(step['hold_s'])}")
+        for kind, target, value in step["actions"]:
+            if kind == "P":
+                self.app.set_pressure(target, value)
+            else:
+                self.app.set_voltage_channel(target, value)
+
+        self.deadline = time.monotonic() + step["hold_s"]
+        self._tick()
+
+    def _tick(self):
+        if not self.running:
+            return
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            self._next_step()
+            return
+        step = self.steps[self.index]
+        self.app.show_profile_progress(
+            f"{self.profile['name']}  —  loop {self.loop}/{self.profile['loops']},"
+            f"  step {self.index + 1}/{len(self.steps)} '{step['label']}',"
+            f"  {fmt_hms(remaining)} left")
+        self.job = self.app.after(self.TICK_MS, self._tick)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -234,6 +460,7 @@ class App(tk.Tk):
 
         self.rx_queue = queue.Queue()
         self.link = SerialLink(self.rx_queue.put)
+        self.runner = None
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -267,9 +494,21 @@ class App(tk.Tk):
         ttk.Button(bottom, text="Dump DAC",
                    command=lambda: self.send_cmd("DUMP")).pack(side="left", padx=6)
 
+        # --- test profile bar ---
+        script = ttk.LabelFrame(self, text=" Test profile ")
+        script.grid(row=2 + len(REGULATORS), column=0, sticky="ew", padx=8, pady=(0, 6))
+        self.script_btn = ttk.Button(script, text="Script…", width=10,
+                                     command=self.choose_profile)
+        self.script_btn.pack(side="left", padx=(8, 4), pady=6)
+        self.stop_btn = ttk.Button(script, text="Stop", width=8,
+                                   state="disabled", command=self.stop_profile)
+        self.stop_btn.pack(side="left", padx=4, pady=6)
+        self.profile_label = ttk.Label(script, text="idle", foreground="#444")
+        self.profile_label.pack(side="left", padx=8)
+
         self.log = tk.Text(self, height=7, width=78, state="disabled",
                            font="TkFixedFont")
-        self.log.grid(row=2 + len(REGULATORS), column=0, padx=8, pady=(0, 8))
+        self.log.grid(row=3 + len(REGULATORS), column=0, padx=8, pady=(0, 8))
 
         self.refresh_ports()
         self.after(50, self.poll_rx)
@@ -285,6 +524,10 @@ class App(tk.Tk):
 
     def toggle_connect(self):
         if self.link.connected:
+            # Never leave a profile running against a port that is about to
+            # close; it would keep ticking and log a send failure per step.
+            if self.runner is not None:
+                self.runner.stop("stopped — port disconnected")
             self.link.disconnect()
             self.status.config(text="disconnected", foreground="#a00")
             self.connect_btn.config(text="Connect")
@@ -305,6 +548,8 @@ class App(tk.Tk):
         self.after(2700, lambda: self.send_cmd("GET"))
 
     def on_close(self):
+        if self.runner is not None:
+            self.runner.stop("stopped — window closed")
         if self.link.connected:
             try:
                 self.link.send("ZERO")
@@ -330,7 +575,59 @@ class App(tk.Tk):
     def set_voltage(self, index, volts):
         # Regulator index equals its DAC channel (see the channel table in
         # README.md and the dacChannel field in PressureControl.h).
-        self.send_cmd(f"V {index} {volts:.3f}")
+        self.set_voltage_channel(index, volts)
+
+    def set_voltage_channel(self, channel, volts):
+        self.send_cmd(f"V {channel} {volts:.3f}")
+
+    # --- test profiles ---
+
+    def choose_profile(self):
+        if self.runner is not None:
+            return
+        if not self.link.connected:
+            messagebox.showwarning(
+                "Not connected",
+                "Connect to the Mega before running a test profile.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select a test profile",
+            initialdir=PROFILE_DIR if os.path.isdir(PROFILE_DIR) else None,
+            filetypes=[("Test profile", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            profile = load_profile(path)
+        except (OSError, ValueError) as exc:
+            # Reject the whole profile rather than starting a long run that
+            # would fail partway through.
+            messagebox.showerror("Profile error", f"{os.path.basename(path)}\n\n{exc}")
+            self.log_line(f"! profile rejected: {exc}")
+            return
+        self.start_profile(profile)
+
+    def start_profile(self, profile):
+        for panel in self.panels:
+            panel.set_enabled(False)
+        self.script_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.runner = ProfileRunner(self, profile)
+        self.runner.start()
+
+    def stop_profile(self):
+        if self.runner is not None:
+            self.runner.stop("stopped by user")
+
+    def on_profile_finished(self):
+        self.runner = None
+        for panel in self.panels:
+            panel.set_enabled(True)
+        self.script_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self.show_profile_progress("idle")
+
+    def show_profile_progress(self, text):
+        self.profile_label.config(text=text)
 
     def zero_all(self):
         for panel in self.panels:
