@@ -51,6 +51,17 @@ public:
 
   float pressureSetpoint(uint8_t reg) const { return _setpoint[reg]; }
   float voltageSetpoint(uint8_t reg) const { return _voltage[reg]; }
+
+  //! Inverse of the setPressure() mapping: what pressure a given command
+  //! voltage corresponds to. Lets status reporting derive pressure from the
+  //! DAC's actual output instead of a cached setpoint, so a raw `V` command
+  //! on a regulator channel is reported honestly.
+  float pressureFromVoltage(uint8_t reg, float volts) const
+  {
+    if (reg >= NUM_REGULATORS) return NAN;
+    const RegulatorConfig &c = _cfg[reg];
+    return c.pMin + (volts - c.vMin) * (c.pMax - c.pMin) / (c.vMax - c.vMin);
+  }
   const RegulatorConfig &config(uint8_t reg) const { return _cfg[reg]; }
 
 private:

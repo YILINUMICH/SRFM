@@ -62,7 +62,15 @@ void LTC2668::setSpanAll(uint16_t span)
 
 void LTC2668::setCode(uint8_t channel, uint16_t code)
 {
+  channel &= 0x0F;
+  _code[channel] = code;
   write(LTC2668_CMD_WRITE_N_UPDATE_N, channel, code);
+}
+
+float LTC2668::voltage(uint8_t channel) const
+{
+  channel &= 0x0F;
+  return codeToVoltage(_code[channel], spanMin(_span[channel]), spanMax(_span[channel]));
 }
 
 float LTC2668::setVoltage(uint8_t channel, float volts)

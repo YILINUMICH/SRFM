@@ -109,6 +109,13 @@ public:
   //! Current span code of a channel (as tracked by this driver).
   uint16_t span(uint8_t channel) const { return _span[channel & 0x0F]; }
 
+  //! Last code written to a channel, and the voltage that code represents
+  //! under the channel's current span. This is the driver's record of what
+  //! the hardware was actually told, so it stays correct whether the channel
+  //! was set via setVoltage(), setCode(), or a regulator pressure command.
+  uint16_t code(uint8_t channel) const { return _code[channel & 0x0F]; }
+  float    voltage(uint8_t channel) const;
+
 private:
   //! Send one 32-bit frame; updates _verified from the SDO echo.
   void write(uint8_t command, uint8_t address, uint16_t data);
@@ -116,6 +123,7 @@ private:
   uint8_t     _cs = 0xFF;
   SPISettings _spiSettings;
   uint16_t    _span[LTC2668_NUM_CHANNELS] = {0};
+  uint16_t    _code[LTC2668_NUM_CHANNELS] = {0};
   uint8_t     _lastTx[3] = {0};
   bool        _haveLastTx = false;
   bool        _verified = false;
