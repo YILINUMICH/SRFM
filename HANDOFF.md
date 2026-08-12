@@ -66,10 +66,12 @@ voltage = vMin + (p − pMin)·(vMax − vMin)/(pMax − pMin)
   the current setpoint** under the new calibration.
 - `zeroAll()` drives every regulator to its zero-pressure voltage.
 
-⚠️ **Defaults are placeholders**, not real regulator calibrations:
-reg 0 `AIR` ch0 0–10V→0…+100; regs 1–3 `VAC1..3` ch1–3 0–10V→0…−100 (kPa).
-Fix in `PressureControl.h` (compile-time) or via `CAL` (runtime, not
-persisted — lost on reset).
+Defaults match the actual hardware (all kPa):
+reg 0 `AIR` ch0 = SMC **ITV0030-3BL** (0–10V → +1…+500 kPa);
+regs 1–3 `VAC1..3` ch1–3 = SMC **ITV2090-312L5** (0–10V → −1.3…−80 kPa).
+Adjust in `PressureControl.h` (compile-time) or via `CAL` (runtime, not
+persisted — lost on reset). Note "zero" for the vacuum regs clamps to
+−1.3 kPa = 0V (minimum vacuum), and for air to +1 kPa = 0V.
 
 ### Layer 3 — Firmware protocol (`src/main.cpp`)
 
@@ -160,9 +162,11 @@ Last verified build: SUCCESS — RAM 534 B (6.5%), flash 8804 B (3.5%).
 
 1. **Hardware smoke test**: flash, wire per §4, `V 0 5` → measure 5.000V on
    VOUT0; `V 0 -10` → −10V; verify `ZERO`.
-2. **Real calibrations**: get regulator model numbers (e.g. SMC ITV series),
-   set `RegulatorConfig` defaults + GUI `REGULATORS` ranges to match.
-3. Confirm regulators accept 0–10V command (some are 1–5V or 4–20 mA — a
-   current-input regulator would need a V→I converter).
-4. Optional: EEPROM cal persistence, GUI cal editor, status polling timer,
-   `git init` (repo is not under version control yet).
+2. **Verify calibration against a gauge**: defaults use datasheet ranges for
+   the SMC ITV0030-3BL (air) and ITV2090-312L5 (vacuum, both 0–10V command);
+   trim with `CAL` / header edits if a reference gauge disagrees.
+3. Regulators need their own 24 VDC supply (command signal is 0–10V from the
+   DAC, but the ITV valves are 24V-powered devices).
+4. Optional: EEPROM cal persistence, GUI cal editor, status polling timer.
+
+Repo: https://github.com/YILINUMICH/SRFM (private).

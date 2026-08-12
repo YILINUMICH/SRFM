@@ -66,17 +66,20 @@ pio device monitor      # 115200 baud, expect: "OK SRFM-DAC v1.0 ready"
 Setpoints are clamped to the calibrated range; the reply always shows what
 was actually applied.
 
-## Calibration — edit before real use
+## Calibration
 
-Defaults (in `lib/PressureControl/PressureControl.h`) are placeholders:
+Defaults (in `lib/PressureControl/PressureControl.h`) match the actual
+regulators, all pressures in kPa:
 
-- Air (reg 0): 0–10V → 0…+100 (e.g. kPa)
-- Vacuum (reg 1–3): 0–10V → 0…−100 kPa
+| Reg | Model | Command | Pressure range |
+|---|---|---|---|
+| 0 AIR | SMC ITV0030-3BL | 0–10 VDC | +1 … +500 kPa (0.001–0.5 MPa) |
+| 1–3 VAC | SMC ITV2090-312L5 | 0–10 VDC | −1.3 … −80 kPa |
 
-Match them to your regulators' datasheets, either by editing the header or at
-runtime with `CAL`, e.g. a regulator with 0–10V command for 0.005–0.9 MPa:
-`CAL 0 0.06 10 5 900` (in kPa). Update the `REGULATORS` slider ranges at the
-top of `gui/pressure_gui.py` to match.
+Both models take a 0–10V command signal, so no signal conditioning is needed
+between VOUT0–3 and the regulators. To tweak the mapping (e.g. after
+verifying against a gauge), edit the header or use `CAL` at runtime; keep the
+`REGULATORS` slider ranges at the top of `gui/pressure_gui.py` in sync.
 
 ## GUI
 

@@ -20,10 +20,10 @@ BAUD = 115200
 # Display ranges for the sliders; must match the firmware/CAL calibration.
 # (name, min, max, unit)
 REGULATORS = [
-    ("Air pressure", 0.0, 100.0, "kPa"),
-    ("Vacuum 1", -100.0, 0.0, "kPa"),
-    ("Vacuum 2", -100.0, 0.0, "kPa"),
-    ("Vacuum 3", -100.0, 0.0, "kPa"),
+    ("Air pressure (ITV0030)", 1.0, 500.0, "kPa"),
+    ("Vacuum 1 (ITV2090)", -80.0, -1.3, "kPa"),
+    ("Vacuum 2 (ITV2090)", -80.0, -1.3, "kPa"),
+    ("Vacuum 3 (ITV2090)", -80.0, -1.3, "kPa"),
 ]
 
 

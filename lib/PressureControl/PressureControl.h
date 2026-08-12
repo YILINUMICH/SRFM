@@ -7,11 +7,12 @@ so any command-voltage regulator (0-10V, 0-5V, 1-5V, inverted, ...) can be
 described by its two endpoints. Setpoints are clamped to [pMin, pMax]
 (or [pMax, pMin] for vacuum regulators whose pMin > pMax).
 
-Default configuration (EDIT TO MATCH YOUR REGULATORS — see README):
-  regulator 0: air pressure, DAC ch 0, 0V..10V  ->   0 .. +100  (e.g. kPa)
-  regulator 1: vacuum,       DAC ch 1, 0V..10V  ->   0 .. -100  (e.g. kPa)
-  regulator 2: vacuum,       DAC ch 2, 0V..10V  ->   0 .. -100
-  regulator 3: vacuum,       DAC ch 3, 0V..10V  ->   0 .. -100
+Default configuration, all pressures in kPa:
+  regulator 0: SMC ITV0030-3BL   air pressure, ch 0, 0..10V -> +1 .. +500 kPa
+  regulator 1: SMC ITV2090-312L5 vacuum,       ch 1, 0..10V -> -1.3 .. -80 kPa
+  regulator 2: SMC ITV2090-312L5 vacuum,       ch 2, 0..10V -> -1.3 .. -80 kPa
+  regulator 3: SMC ITV2090-312L5 vacuum,       ch 3, 0..10V -> -1.3 .. -80 kPa
+(Ranges from the SMC datasheets; both models take a 0-10 VDC command signal.)
 */
 
 #ifndef PRESSURE_CONTROL_H
@@ -55,10 +56,10 @@ public:
 private:
   LTC2668        *_dac = nullptr;
   RegulatorConfig _cfg[NUM_REGULATORS] = {
-    {"AIR",  0, 0.0, 10.0, 0.0,  100.0},
-    {"VAC1", 1, 0.0, 10.0, 0.0, -100.0},
-    {"VAC2", 2, 0.0, 10.0, 0.0, -100.0},
-    {"VAC3", 3, 0.0, 10.0, 0.0, -100.0},
+    {"AIR",  0, 0.0, 10.0,  1.0, 500.0},   // ITV0030-3BL: 0.001-0.5 MPa
+    {"VAC1", 1, 0.0, 10.0, -1.3, -80.0},   // ITV2090-312L5
+    {"VAC2", 2, 0.0, 10.0, -1.3, -80.0},   // ITV2090-312L5
+    {"VAC3", 3, 0.0, 10.0, -1.3, -80.0},   // ITV2090-312L5
   };
   float _setpoint[NUM_REGULATORS] = {0};
   float _voltage[NUM_REGULATORS] = {0};
