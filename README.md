@@ -37,9 +37,20 @@ Use the SPI through-hole test points next to J1 (or J1 itself).
 Analog supply (bench supply): **V+ = +15V, V− = −15V, GND** on the EVM turret
 posts. ±15V is required for the ±10V SoftSpan range.
 
-Jumpers: leave at factory default — `MSP0/1/2 = 1` (SoftSpan mode, powers up
-0–5V span at 0V), `REF_SEL = INT`. The firmware switches all channels to
-±10V span and 0V output at boot.
+Jumper configuration (as set on our board — this is the factory default):
+
+| Jumper | Function | Setting |
+|---|---|---|
+| JP1 | REF_SEL | **INT** (internal 2.5V reference) |
+| JP2 | MSP0 | **1** |
+| JP3 | MSP1 | **1** |
+| JP4 | MSP2 | **1** |
+
+MSP0/1/2 = 1/1/1 selects **SoftSpan mode**: powers up in the 0–5V span at
+zero-scale (0V). The firmware then switches all channels to ±10V span and
+0V output at boot. Do not change these jumpers — any other MSP setting
+locks the part into a fixed manual span and the firmware's span commands
+would be ignored.
 
 Regulator command inputs connect to **VOUT0–VOUT3** (+ their grounds):
 VOUT0 = air pressure, VOUT1–3 = vacuum.

@@ -121,7 +121,11 @@ lines are dropped with an error.
 
 - Bench supply **V+ = +15V, V− = −15V** on the turret posts (±15V required
   for the ±10V span).
-- Jumpers at factory default: `MSP0/1/2 = 1` (SoftSpan), `REF_SEL = INT`.
+- Jumpers, as configured on our board (= factory default):
+  **JP1 REF_SEL = INT**, **JP2 MSP0 = 1**, **JP3 MSP1 = 1**, **JP4 MSP2 = 1**.
+  MSP 1/1/1 = SoftSpan mode (power-up 0–5V span, zero-scale); the driver's
+  `begin()` assumes exactly this power-on state. Other MSP settings force a
+  fixed manual span and span commands are ignored — don't change them.
 - Regulator command inputs on **VOUT0–VOUT3**.
 - DC2025A-A = 16-bit part, DC2025A-B = 12-bit. Firmware assumes 16-bit
   codes; a -B board still works (low 4 bits ignored by the part).
