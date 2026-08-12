@@ -20,6 +20,8 @@ import serial.tools.list_ports
 
 BAUD = 115200
 
+COPYRIGHT = "\u00a9 Soft Robot Face Mask User Interface, Aug 2026, Y. Ma  UofM"
+
 # DAC command-signal range. Must match the span the firmware selects in setup()
 # (LTC2668_SPAN_0_TO_10V) and the 0-10V input both regulator models accept.
 VOLT_MIN, VOLT_MAX = 0.0, 10.0
@@ -258,13 +260,13 @@ class RegulatorPanel(ttk.LabelFrame):
             self,
             text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}"
                   f"        DAC    {VOLT_MIN:g} … {VOLT_MAX:g} V"),
-        ).grid(row=0, column=0, columnspan=4, padx=10, pady=(6, 4), sticky="w")
+        ).grid(row=0, column=0, columnspan=5, padx=10, pady=(6, 4), sticky="w")
 
         # --- preset buttons: one click straight to a working setpoint ---
         ttk.Label(self, text="Presets").grid(
             row=1, column=0, padx=(10, 6), pady=2, sticky="w")
         preset_bar = ttk.Frame(self)
-        preset_bar.grid(row=1, column=1, columnspan=3, padx=(0, 10), pady=2, sticky="w")
+        preset_bar.grid(row=1, column=1, columnspan=4, padx=(0, 10), pady=2, sticky="w")
         self.controls = []
         for value in presets:
             button = ttk.Button(
@@ -286,8 +288,12 @@ class RegulatorPanel(ttk.LabelFrame):
         ttk.Label(self, text=unit, width=4).grid(row=2, column=2, padx=(6, 0), sticky="w")
         p_button = ttk.Button(self, text="Set", width=7,
                               command=self.apply_pressure_entry)
-        p_button.grid(row=2, column=3, padx=(4, 10), sticky="w")
-        self.controls += [self.p_entry, p_button]
+        p_button.grid(row=2, column=3, padx=(4, 2), sticky="w")
+
+        # --- clear this valve on its own, without disturbing the other three ---
+        clear_button = ttk.Button(self, text="CLEAR", width=7, command=self.clear)
+        clear_button.grid(row=2, column=4, padx=(2, 10), sticky="w")
+        self.controls += [self.p_entry, p_button, clear_button]
 
         # --- manual voltage entry (bypasses the pressure mapping) ---
         ttk.Label(self, text="Voltage").grid(
@@ -300,14 +306,14 @@ class RegulatorPanel(ttk.LabelFrame):
         ttk.Label(self, text="V", width=4).grid(row=3, column=2, padx=(6, 0), sticky="w")
         v_button = ttk.Button(self, text="Set V", width=7,
                               command=self.apply_voltage_entry)
-        v_button.grid(row=3, column=3, padx=(4, 10), sticky="w")
+        v_button.grid(row=3, column=3, padx=(4, 2), sticky="w")
         self.controls += [self.v_entry, v_button]
 
         self.readback = ttk.Label(self, text="commanded    —", foreground="#444")
-        self.readback.grid(row=4, column=0, columnspan=4, padx=10, pady=(6, 2),
+        self.readback.grid(row=4, column=0, columnspan=5, padx=10, pady=(6, 2),
                            sticky="w")
         self.msg = ttk.Label(self, text="", foreground="#a00")
-        self.msg.grid(row=5, column=0, columnspan=4, padx=10, pady=(0, 6), sticky="w")
+        self.msg.grid(row=5, column=0, columnspan=5, padx=10, pady=(0, 6), sticky="w")
 
     # --- input handling ---
 
@@ -364,6 +370,16 @@ class RegulatorPanel(ttk.LabelFrame):
         state = "normal" if enabled else "disabled"
         for widget in self.controls:
             widget.config(state=state)
+
+    def clear(self):
+        """Drive this one regulator to zero and reset its entries.
+
+        Sends the same 0 kPa setpoint ZERO ALL uses, so the firmware clamps it
+        to the safe end of this channel's range (1 kPa for air, -1.3 kPa for
+        the vacuum units) instead of the GUI reporting an out-of-range value.
+        """
+        self.reset_fields()
+        self.on_set_pressure(self.index, 0.0)
 
     def reset_fields(self):
         self.p_entry.delete(0, "end")
@@ -516,7 +532,10 @@ class App(tk.Tk):
 
         self.log = tk.Text(self, height=7, width=78, state="disabled",
                            font="TkFixedFont")
-        self.log.grid(row=3 + len(REGULATORS), column=0, padx=8, pady=(0, 8))
+        self.log.grid(row=3 + len(REGULATORS), column=0, padx=8, pady=(0, 4))
+
+        ttk.Label(self, text=COPYRIGHT, foreground="#777").grid(
+            row=4 + len(REGULATORS), column=0, padx=10, pady=(0, 6), sticky="e")
 
         self.refresh_ports()
         self.after(50, self.poll_rx)

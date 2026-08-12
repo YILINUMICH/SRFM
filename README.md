@@ -206,7 +206,9 @@ buttons or its manual entries. Preset buttons are labelled with both the
 pressure and the command voltage the firmware will program. Each panel also
 takes a raw voltage, sending `V <ch> <volts>` for debugging.
 
-`ZERO ALL` is the panic button; the GUI also sends `ZERO` on window close.
+`CLEAR` drops one regulator back to zero and resets that panel's entries,
+leaving the other three where they are. `ZERO ALL` does the same for every
+channel and is the panic button; the GUI also sends `ZERO` on window close.
 
 ### Test profiles
 
