@@ -20,6 +20,7 @@ USB serial.
 | `lib/PressureControl/` | Voltage↔pressure linear mapping for the 4 regulators |
 | `src/main.cpp` | Firmware: init, safe-state, serial command protocol |
 | `gui/pressure_gui.py` | tkinter GUI (needs `pip install -r requirements.txt`) |
+| `gui/profiles/` | JSON test profiles for long unattended runs, with their own [README](gui/profiles/README.md) |
 
 ## Wiring: Mega ↔ DC2025A
 
@@ -98,13 +99,55 @@ mapping lives in the `RegulatorConfig` table in
 `lib/PressureControl/PressureControl.h` (`dacChannel` field) — change it
 there if the wiring changes.
 
-## Build & flash
+## Deployment
+
+From a fresh checkout to a running system. Wiring and supplies should
+already be done — see the sections above.
+
+**1. Install the tools.** Needs Python 3.9 or newer:
 
 ```sh
-pio run                 # compile
-pio run -t upload       # flash the Mega
-pio device monitor      # 115200 baud, expect: "OK SRFM-DAC v1.0 ready"
+pip install -r requirements.txt     # pyserial, for the GUI
+pip install platformio              # firmware toolchain
 ```
+
+**2. Build and flash the firmware.** Plug the Mega in over USB first:
+
+```sh
+pio run                             # compile
+pio run -t upload                   # flash
+```
+
+PlatformIO picks the port itself. If it picks the wrong one, name it —
+`COM3` on Windows, `/dev/cu.usbmodem*` on macOS, `/dev/ttyACM*` on Linux:
+
+```sh
+pio run -t upload --upload-port COM3
+```
+
+**3. Confirm it came up:**
+
+```sh
+pio device monitor                  # 115200 baud
+```
+
+Expect `OK SRFM-DAC v1.0 ready`. Type `VERIFY` — a reply of `OK verify=yes`
+means the SPI link to the DAC is good. Ctrl-C to quit the monitor, and make
+sure it *is* closed before starting the GUI: only one program can hold the
+port at a time.
+
+**4. Run the GUI:**
+
+```sh
+python gui/pressure_gui.py
+```
+
+Pick the port, press Connect, and the four regulator panels go live.
+
+> **No serial port listed?** Check the USB cable carries data — charge-only
+> cables power the board and enumerate nothing, which looks identical to a
+> dead Mega. Try a different cable and a direct port rather than a hub before
+> suspecting the board.
 
 ## Serial protocol (115200, one command per line)
 
@@ -150,14 +193,12 @@ regulators, all pressures in kPa:
 Both models take a 0–10V command signal, so no signal conditioning is needed
 between VOUT0–3 and the regulators. To tweak the mapping (e.g. after
 verifying against a gauge), edit the header or use `CAL` at runtime; keep the
-`REGULATORS` slider ranges at the top of `gui/pressure_gui.py` in sync.
+`REGULATORS` table at the top of `gui/pressure_gui.py` in sync, since the
+GUI's ranges and preset voltages are computed from it.
 
 ## GUI
 
-```sh
-pip install -r requirements.txt
-python3 gui/pressure_gui.py
-```
+Started with `python gui/pressure_gui.py` — see [Deployment](#deployment).
 
 Pick the Mega's port (`COM…` on Windows, `usbmodem…` on macOS), Connect
 (waits ~2.5s for the auto-reset), then drive each regulator from its preset
