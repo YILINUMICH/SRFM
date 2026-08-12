@@ -194,6 +194,7 @@ class SerialLink:
         self.ser = None
         self.on_line = on_line
         self._thread = None
+        self._closing = False
 
     @property
     def connected(self):
@@ -201,11 +202,13 @@ class SerialLink:
 
     def connect(self, port):
         self.disconnect()
+        self._closing = False
         self.ser = serial.Serial(port, BAUD, timeout=0.2)
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
     def disconnect(self):
+        self._closing = True
         if self.ser is not None:
             try:
                 self.ser.close()
@@ -221,10 +224,14 @@ class SerialLink:
 
     def _read_loop(self):
         ser = self.ser
-        while ser is not None and ser.is_open:
+        while ser is not None and ser.is_open and not self._closing:
             try:
                 raw = ser.readline()
-            except (serial.SerialException, TypeError, OSError):
+            except (serial.SerialException, TypeError, OSError, AttributeError):
+                # close() runs on the main thread while this read is blocked.
+                # pyserial's win32 backend tears down _overlapped_read as it
+                # closes, so the in-flight read surfaces as an AttributeError
+                # from inside pyserial rather than a clean SerialException.
                 break
             if raw:
                 self.on_line(raw.decode("ascii", errors="replace").strip())
@@ -461,6 +468,7 @@ class App(tk.Tk):
         self.rx_queue = queue.Queue()
         self.link = SerialLink(self.rx_queue.put)
         self.runner = None
+        self._refresh_job = None
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -580,6 +588,21 @@ class App(tk.Tk):
     def set_voltage_channel(self, channel, volts):
         self.send_cmd(f"V {channel} {volts:.3f}")
 
+    def request_status(self, delay_ms=120):
+        """Ask for a GET, coalescing bursts into one.
+
+        A profile step that sets four regulators produces four acks; without
+        this each would queue its own GET and the log would fill with
+        identical status lines.
+        """
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+        self._refresh_job = self.after(delay_ms, self._send_status_request)
+
+    def _send_status_request(self):
+        self._refresh_job = None
+        self.send_cmd("GET")
+
     # --- test profiles ---
 
     def choose_profile(self):
@@ -633,7 +656,7 @@ class App(tk.Tk):
         for panel in self.panels:
             panel.reset_fields()
         self.send_cmd("ZERO")
-        self.after(80, lambda: self.send_cmd("GET"))
+        self.request_status()
 
     # --- receive path ---
 
@@ -660,7 +683,7 @@ class App(tk.Tk):
         # Pull a full status afterwards so every panel stays in step, including
         # the ones the command did not touch.
         if (" p=" in body and " v=" in body) or body.startswith("ch"):
-            self.after(80, lambda: self.send_cmd("GET"))
+            self.request_status()
             return
 
         # Full status: "AIR=250.50,5.000V; VAC1=-1.30,0.000V; ..."

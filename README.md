@@ -188,15 +188,6 @@ voltage paths) and `vacuum_soak.json` (~1h45m, 4 loops).
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `name` | shown in the progress line; defaults to the filename |
-| `loops` | repeat count for the whole step list, default 1 |
-| `zero_on_finish` | send `ZERO` when the run ends or is stopped, default true |
-| `steps[].label` | shown in the progress line and the log |
-| `steps[].hold_s` | how long to hold this step, seconds |
-| `steps[].set` | setpoints applied at the start of the step |
-
 A `set` entry is either `{"reg": 0-3, "kPa": <pressure>}` for the pressure
 layer or `{"ch": 0-15, "volts": <volts>}` to drive a DAC channel directly.
 An empty `set` holds whatever the previous step left in place.
@@ -204,7 +195,7 @@ An empty `set` holds whatever the previous step left in place.
 The whole file is validated before the run starts — including every
 setpoint against that regulator's calibrated range — so a typo is caught up
 front rather than eight hours in. Manual controls lock while a profile runs;
-**Stop** ends it within a quarter second and zeroes the outputs. Holds are
-timed against monotonic deadlines rather than by counting ticks, so a long
-soak will not drift, and the run is driven from Tk's event loop rather than
-a thread, so nothing else contends for the serial port.
+**Stop** ends it within a quarter second and zeroes the outputs.
+
+**See [`gui/profiles/README.md`](gui/profiles/README.md) for the full field
+reference and worked examples.**
