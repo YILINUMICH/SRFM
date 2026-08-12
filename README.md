@@ -19,7 +19,7 @@ USB serial.
 | `lib/LTC2668/` | Self-contained LTC2668 SPI driver (`begin`, `setSpanAll`, `setVoltage`, …) |
 | `lib/PressureControl/` | Voltage↔pressure linear mapping for the 4 regulators |
 | `src/main.cpp` | Firmware: init, safe-state, serial command protocol |
-| `gui/pressure_gui.py` | tkinter GUI (needs `pip install -r gui/requirements.txt`) |
+| `gui/pressure_gui.py` | tkinter GUI (needs `pip install -r requirements.txt`) |
 
 ## Wiring: Mega ↔ DC2025A
 
@@ -95,7 +95,7 @@ verifying against a gauge), edit the header or use `CAL` at runtime; keep the
 ## GUI
 
 ```sh
-pip install -r gui/requirements.txt
+pip install -r requirements.txt
 python3 gui/pressure_gui.py
 ```
 

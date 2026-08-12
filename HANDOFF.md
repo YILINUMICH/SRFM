@@ -27,7 +27,7 @@ voltage command.
 | `lib/PressureControl/PressureControl.{h,cpp}` | Pressure↔voltage mapping (class `PressureController`) |
 | `src/main.cpp` | Firmware entry point + serial command protocol |
 | `gui/pressure_gui.py` | tkinter GUI (pyserial) |
-| `gui/requirements.txt` | `pyserial>=3.5` |
+| `requirements.txt` | Python deps for the GUI (`pyserial>=3.5`), at root for easy deploy |
 | `README.md` | User-facing build/wiring/usage guide |
 
 ## 3. Architecture (three layers)
@@ -136,7 +136,7 @@ lines are dropped with an error.
 pio run                          # compile  (PlatformIO 6.1.19; CLI at ~/.platformio/penv/bin/pio)
 pio run -t upload                # flash
 pio device monitor               # expect "OK SRFM-DAC v1.0 ready"
-pip install -r gui/requirements.txt
+pip install -r requirements.txt
 python3 gui/pressure_gui.py
 ```
 
