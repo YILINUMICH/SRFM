@@ -26,6 +26,11 @@ COPYRIGHT = "\u00a9 Soft Robot Face Mask User Interface, Aug 2026, Y. Ma  UofM"
 # (LTC2668_SPAN_0_TO_10V) and the 0-10V input both regulator models accept.
 VOLT_MIN, VOLT_MAX = 0.0, 10.0
 
+# Preset buttons wrap onto a second line after this many. The four regulator
+# panels are laid out in a single row, so a panel has to stay narrow enough
+# that four of them fit across an ordinary screen.
+PRESETS_PER_ROW = 3
+
 # (name, pressure at 0V, pressure at 10V, unit, preset buttons)
 # The two pressures are in calibration order — pressure at vMin then at vMax,
 # matching the table in lib/PressureControl/PressureControl.h. They are NOT
@@ -256,25 +261,29 @@ class RegulatorPanel(ttk.LabelFrame):
 
         vcmd = (self.register(is_partial_number), "%P")
 
+        # The panels sit side by side, so everything here is stacked to keep a
+        # panel about a quarter of the window wide.
         ttk.Label(
             self,
-            text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}"
-                  f"        DAC    {VOLT_MIN:g} … {VOLT_MAX:g} V"),
+            text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}\n"
+                  f"DAC      {VOLT_MIN:g} … {VOLT_MAX:g} V"),
+            justify="left",
         ).grid(row=0, column=0, columnspan=5, padx=10, pady=(6, 4), sticky="w")
 
         # --- preset buttons: one click straight to a working setpoint ---
         ttk.Label(self, text="Presets").grid(
-            row=1, column=0, padx=(10, 6), pady=2, sticky="w")
+            row=1, column=0, padx=(10, 6), pady=2, sticky="nw")
         preset_bar = ttk.Frame(self)
         preset_bar.grid(row=1, column=1, columnspan=4, padx=(0, 10), pady=2, sticky="w")
         self.controls = []
-        for value in presets:
+        for n, value in enumerate(presets):
             button = ttk.Button(
                 preset_bar,
                 text=f"{value:g} {unit}\n{self.voltage_for(value):.2f} V",
                 width=9,
                 command=lambda v=value: self.apply_pressure(v))
-            button.pack(side="left", padx=2)
+            button.grid(row=n // PRESETS_PER_ROW, column=n % PRESETS_PER_ROW,
+                        padx=2, pady=1)
             self.controls.append(button)
 
         # --- manual pressure entry ---
@@ -309,7 +318,8 @@ class RegulatorPanel(ttk.LabelFrame):
         v_button.grid(row=3, column=3, padx=(4, 2), sticky="w")
         self.controls += [self.v_entry, v_button]
 
-        self.readback = ttk.Label(self, text="commanded    —", foreground="#444")
+        self.readback = ttk.Label(self, text="commanded    —", foreground="#444",
+                                  justify="left")
         self.readback.grid(row=4, column=0, columnspan=5, padx=10, pady=(6, 2),
                            sticky="w")
         self.msg = ttk.Label(self, text="", foreground="#a00")
@@ -390,7 +400,7 @@ class RegulatorPanel(ttk.LabelFrame):
 
     def show_readback(self, pressure, volts):
         self.readback.config(
-            text=f"commanded    {pressure} {self.unit}        DAC    {volts} V")
+            text=f"commanded    {pressure} {self.unit}\nDAC          {volts} V")
 
 
 class ProfileRunner:
@@ -479,7 +489,10 @@ class App(tk.Tk):
         super().__init__()
         self.title("SRFM Regulator Control")
         self.resizable(False, False)
-        self.columnconfigure(0, weight=1)
+        # One column per regulator; every other widget spans the full width.
+        span = len(REGULATORS)
+        for column in range(span):
+            self.columnconfigure(column, weight=1, uniform="panel")
 
         self.rx_queue = queue.Queue()
         self.link = SerialLink(self.rx_queue.put)
@@ -488,7 +501,7 @@ class App(tk.Tk):
 
         # --- connection bar ---
         bar = ttk.Frame(self)
-        bar.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        bar.grid(row=0, column=0, columnspan=span, sticky="ew", padx=8, pady=8)
         ttk.Label(bar, text="Port:").pack(side="left")
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(bar, textvariable=self.port_var, width=26)
@@ -499,17 +512,18 @@ class App(tk.Tk):
         self.status = ttk.Label(bar, text="disconnected", foreground="#a00")
         self.status.pack(side="left", padx=6)
 
-        # --- regulator panels, one per row ---
+        # --- regulator panels, one per column ---
         self.panels = []
         for i, (name, p_at_0v, p_at_10v, unit, presets) in enumerate(REGULATORS):
             panel = RegulatorPanel(self, i, name, p_at_0v, p_at_10v, unit, presets,
                                    self.set_pressure, self.set_voltage)
-            panel.grid(row=1 + i, column=0, padx=8, pady=4, sticky="ew")
+            panel.grid(row=1, column=i, padx=(8 if i == 0 else 4, 8), pady=4,
+                       sticky="nsew")
             self.panels.append(panel)
 
         # --- bottom bar ---
         bottom = ttk.Frame(self)
-        bottom.grid(row=1 + len(REGULATORS), column=0, sticky="ew", padx=8, pady=(4, 8))
+        bottom.grid(row=2, column=0, columnspan=span, sticky="ew", padx=8, pady=(4, 8))
         ttk.Button(bottom, text="ZERO ALL", command=self.zero_all).pack(side="left")
         ttk.Button(bottom, text="Refresh status",
                    command=lambda: self.send_cmd("GET")).pack(side="left", padx=6)
@@ -520,7 +534,7 @@ class App(tk.Tk):
 
         # --- test profile bar ---
         script = ttk.LabelFrame(self, text=" Test profile ")
-        script.grid(row=2 + len(REGULATORS), column=0, sticky="ew", padx=8, pady=(0, 6))
+        script.grid(row=3, column=0, columnspan=span, sticky="ew", padx=8, pady=(0, 6))
         self.script_btn = ttk.Button(script, text="Script…", width=10,
                                      command=self.choose_profile)
         self.script_btn.pack(side="left", padx=(8, 4), pady=6)
@@ -530,12 +544,13 @@ class App(tk.Tk):
         self.profile_label = ttk.Label(script, text="idle", foreground="#444")
         self.profile_label.pack(side="left", padx=8)
 
-        self.log = tk.Text(self, height=7, width=78, state="disabled",
+        self.log = tk.Text(self, height=8, width=78, state="disabled",
                            font="TkFixedFont")
-        self.log.grid(row=3 + len(REGULATORS), column=0, padx=8, pady=(0, 4))
+        self.log.grid(row=4, column=0, columnspan=span, sticky="ew",
+                      padx=8, pady=(0, 4))
 
         ttk.Label(self, text=COPYRIGHT, foreground="#777").grid(
-            row=4 + len(REGULATORS), column=0, padx=10, pady=(0, 6), sticky="e")
+            row=5, column=0, columnspan=span, padx=10, pady=(0, 6), sticky="e")
 
         self.refresh_ports()
         self.after(50, self.poll_rx)
