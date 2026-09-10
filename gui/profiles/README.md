@@ -12,7 +12,7 @@ Drop new profiles in this folder — the file dialog opens here by default.
 {
   "name": "hold 100 kPa for five minutes",
   "steps": [
-    {"label": "pressurise", "hold_s": 300, "set": [{"reg": 0, "kPa": 100}]}
+    {"label": "pressurise", "hold_s": 300, "set": [{"reg": 4, "kPa": 100}]}
   ]
 }
 ```
@@ -47,33 +47,33 @@ step left in place, which is how you write a dwell:
 
 ## Setpoint entries
 
-Each entry in `set` is one of two forms.
+Channels are numbered **1–4**, matching the board silkscreen and the `CH`
+labels on the GUI panels. Each entry in `set` is one of two forms.
 
 **Pressure** — goes through the regulator calibration, same as the `P`
 command and the GUI's preset buttons:
 
 ```json
-{"reg": 0, "kPa": 100}
+{"reg": 4, "kPa": 100}
 ```
 
 | `reg` | Regulator | Valid `kPa` |
 |---|---|---|
-| 0 | air, SMC ITV0030-3BL | `1` … `500` |
 | 1 | vacuum 1, SMC ITV2090-312L5 | `-1.3` … `-80` |
 | 2 | vacuum 2, SMC ITV2090-312L5 | `-1.3` … `-80` |
 | 3 | vacuum 3, SMC ITV2090-312L5 | `-1.3` … `-80` |
+| 4 | air, SMC ITV0030-3BL | `1` … `500` |
 
-**Raw voltage** — bypasses the pressure mapping and drives a DAC channel
-directly, same as the `V` command. Useful for the spare channels 4–15 or for
-debugging:
+**Raw voltage** — bypasses the pressure mapping and sets the voltage at the
+valve's command input directly, same as the `V` command:
 
 ```json
 {"ch": 4, "volts": 2.5}
 ```
 
-`ch` is `0`–`15` and `volts` is `0` … `10`. Channels 0–3 are the four
-regulators, so writing a raw voltage there fights the pressure layer — use
-`reg`/`kPa` for those unless you are deliberately debugging.
+`ch` is `1`–`4` and `volts` is `0` … `10`. Every channel is one of the four
+regulators, so a raw voltage fights the pressure layer on that valve — use
+`reg`/`kPa` unless you are deliberately debugging the voltage path.
 
 A single step can mix both forms and address as many channels as you like;
 they are all applied together at the start of the step:
@@ -83,11 +83,10 @@ they are all applied together at the start of the step:
   "label": "air up, all three vacuums down",
   "hold_s": 600,
   "set": [
-    {"reg": 0, "kPa": 150},
     {"reg": 1, "kPa": -40},
     {"reg": 2, "kPa": -40},
     {"reg": 3, "kPa": -40},
-    {"ch": 5, "volts": 1.0}
+    {"reg": 4, "kPa": 150}
   ]
 }
 ```
@@ -102,6 +101,7 @@ file dialog rather than eight hours into a soak. Messages name the step:
 step 3: 40 kPa is outside regulator 1's range of -80 .. -1.3 kPa
 step 1: 'hold_s' must be greater than zero seconds
 step 2: a 'set' entry needs either 'reg' or 'ch'
+step 4: 'ch' must be 1..4
 'loops' must be a whole number of 1 or more
 ```
 
@@ -119,14 +119,16 @@ Vacuum soak, 3 channels  —  loop 2/4,  step 3/5 'draw vacuum on all three',  7
 
 **Stop** ends the run within a quarter second. The outputs are zeroed on
 finish, on Stop, on disconnect and on closing the window (unless you set
-`zero_on_finish` to `false`).
+`zero_on_finish` to `false`). The board-level **STOP** button also ends a
+running profile before it drops the 24 V rail.
 
 Holds are timed against monotonic deadlines rather than by counting ticks,
-so a long soak will not drift.
+so a long soak will not drift. The GUI keeps sending the firmware's heartbeat
+throughout, so a long hold does not trip the link-loss timeout.
 
 ## Included profiles
 
 | File | Duration | What it does |
 |---|---|---|
-| `quick_check.json` | ~55 s | Bring-up check: steps the air regulator, one vacuum, and a spare channel, exercising both the pressure and raw-voltage paths. Run this first after any wiring change. |
+| `quick_check.json` | ~55 s | Bring-up check: steps the air regulator (CH4) and vacuum 1 (CH1), then drives CH4 by raw voltage, exercising both the pressure and raw-voltage paths. Run this first after any wiring change. |
 | `vacuum_soak.json` | ~1 h 45 m | 4 loops of pressurise → vacuum → deep vacuum → vent across all three vacuum channels. |

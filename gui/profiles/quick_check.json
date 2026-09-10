@@ -4,22 +4,22 @@
   "zero_on_finish": true,
   "steps": [
     {
-      "label": "air to 50 kPa",
+      "label": "air (CH4) to 50 kPa",
       "hold_s": 10,
-      "set": [{"reg": 0, "kPa": 50}]
+      "set": [{"reg": 4, "kPa": 50}]
     },
     {
-      "label": "air to 200 kPa",
+      "label": "air (CH4) to 200 kPa",
       "hold_s": 10,
-      "set": [{"reg": 0, "kPa": 200}]
+      "set": [{"reg": 4, "kPa": 200}]
     },
     {
-      "label": "vacuum 1 to -40 kPa",
+      "label": "vacuum 1 (CH1) to -40 kPa",
       "hold_s": 10,
       "set": [{"reg": 1, "kPa": -40}]
     },
     {
-      "label": "spare channel 4 to 2.5 V",
+      "label": "air (CH4) raw 2.5 V, about 126 kPa",
       "hold_s": 10,
       "set": [{"ch": 4, "volts": 2.5}]
     },
@@ -32,9 +32,8 @@
       "label": "back to rest",
       "hold_s": 5,
       "set": [
-        {"reg": 0, "kPa": 1},
-        {"reg": 1, "kPa": -1.3},
-        {"ch": 4, "volts": 0}
+        {"reg": 4, "kPa": 1},
+        {"reg": 1, "kPa": -1.3}
       ]
     }
   ]

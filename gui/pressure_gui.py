@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """SRFM regulator control GUI.
 
-Talks to the Arduino Mega + LTC2668 firmware over USB serial
-(115200 baud, line-based protocol — see src/main.cpp).
+Talks to the custom SRFM PCB (Seeed XIAO nRF52840 + AD5724R 4-channel DAC +
+ADS1015 monitor ADC) over USB CDC serial. Line-based protocol, one reply per
+command — see PROTOCOL.md at the repository root.
 
 Requires: pyserial  (pip install -r requirements.txt)
 """
@@ -10,6 +11,7 @@ Requires: pyserial  (pip install -r requirements.txt)
 import json
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -18,31 +20,44 @@ from tkinter import filedialog, messagebox, ttk
 import serial
 import serial.tools.list_ports
 
-BAUD = 115200
+BAUD = 115200  # USB CDC ignores it, but pyserial wants a number
 
-COPYRIGHT = "\u00a9 Soft Robot Face Mask User Interface, Aug 2026, Y. Ma  UofM"
+COPYRIGHT = "© Soft Robot Face Mask User Interface, Aug 2026, Y. Ma  UofM"
 
-# DAC command-signal range. Must match the span the firmware selects in setup()
-# (LTC2668_SPAN_0_TO_10V) and the 0-10V input both regulator models accept.
+# Command-signal range at the valve. The firmware scales this onto the DAC
+# code through CAL FS; both SMC regulator models take a 0-10 V input.
 VOLT_MIN, VOLT_MAX = 0.0, 10.0
+
+# The firmware drops the 24 V rail if it hears nothing for the heartbeat
+# timeout (HBT, default 2 s). Sending every second leaves a safe margin.
+HEARTBEAT_MS = 1000
+
+# Delay after opening the port before the first command. The XIAO does not
+# reset when the port opens, so this only has to cover CDC settling.
+CONNECT_SETTLE_MS = 500
 
 # Preset buttons wrap onto a second line after this many. The four regulator
 # panels are laid out in a single row, so a panel has to stay narrow enough
 # that four of them fit across an ordinary screen.
 PRESETS_PER_ROW = 3
 
-# (name, pressure at 0V, pressure at 10V, unit, preset buttons)
-# The two pressures are in calibration order — pressure at vMin then at vMax,
-# matching the table in lib/PressureControl/PressureControl.h. They are NOT
+# One entry per channel CH1..CH4, in channel order (index = ch - 1):
+# (firmware name, display name, pressure at 0V, pressure at 10V, unit, presets)
+#
+# The firmware name is what GET puts before '=' and is used to match a status
+# reply to its panel. The two pressures are in calibration order — pressure at
+# vMin then at vMax, matching the firmware's CAL PRESS endpoints. They are NOT
 # sorted numerically: the vacuum units run from -1.3 kPa at 0V down to
 # -80 kPa at 10V, and showing them in that order is what makes the range
-# readable next to the DAC voltage.
+# readable next to the valve voltage.
 REGULATORS = [
-    ("Air pressure (ITV0030)", 1.0, 500.0, "kPa", (1, 50, 100, 200, 350, 500)),
-    ("Vacuum 1 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
-    ("Vacuum 2 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
-    ("Vacuum 3 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
+    ("VAC1", "Vacuum 1 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
+    ("VAC2", "Vacuum 2 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
+    ("VAC3", "Vacuum 3 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
+    ("AIR", "Air pressure (ITV0030)", 1.0, 500.0, "kPa", (1, 50, 100, 200, 350, 500)),
 ]
+NUM_CHANNELS = len(REGULATORS)
+STATUS_NAMES = [reg[0] for reg in REGULATORS]
 
 
 def to_float(text):
@@ -71,6 +86,103 @@ def fmt_hms(seconds):
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+# --- reply parsing ---------------------------------------------------------
+#
+# Pure functions, kept out of the App class so they can be exercised without
+# a display. The protocol is one reply line per command, starting with OK,
+# ERR or FAULT, plus unsolicited '!' event lines (PROTOCOL.md).
+
+def parse_get_reply(body):
+    """Split a GET reply body into {firmware name: (pressure, volts, monitor)}.
+
+    "VAC1=-40.00,5.000V,49.1%; VAC2=-1.30,0.000V,1.6%; ...; AIR=250.50,5.000V,n/a"
+    -> {"VAC1": ("-40.00", "5.000", "49.1%"), ...}
+
+    Channels are matched by the name before '=', not by position. Parts that
+    do not carry a known name are skipped, so any other reply that happens to
+    contain '=' and ',' (a STATUS line, say) yields an empty dict.
+    """
+    found = {}
+    for part in body.split(";"):
+        name, sep, rhs = part.strip().partition("=")
+        name = name.strip().upper()
+        if not sep or name not in STATUS_NAMES:
+            continue
+        fields = [field.strip() for field in rhs.split(",")]
+        if len(fields) < 2:
+            continue
+        volts = fields[1].rstrip("Vv")
+        monitor = fields[2] if len(fields) > 2 and fields[2] else "n/a"
+        found[name] = (fields[0], volts, monitor)
+    return found
+
+
+def monitor_text(monitor, p_at_0v, p_at_10v, unit):
+    """Monitor field of a GET reply as display text.
+
+    The firmware reports the valve's analog monitor as a percentage of full
+    scale — the same 0-100 % the 0-10 V command spans — so the equivalent
+    pressure comes from the panel's own endpoints:
+    "49.1%" -> "49.1 % ≈ -40.0 kPa". Anything else ("n/a") is shown as-is.
+    """
+    text = monitor.strip()
+    if not text:
+        return "n/a"
+    if not text.endswith("%"):
+        return text
+    pct = to_float(text[:-1])
+    if pct is None:
+        return text
+    pressure = p_at_0v + (p_at_10v - p_at_0v) * pct / 100.0
+    return f"{pct:.1f} % ≈ {pressure:.1f} {unit}"
+
+
+def classify_reply(line):
+    """Sort a line from the controller into what the GUI should do with it.
+
+    Returns (kind, payload):
+      "event"   an unsolicited '!' line (payload: the line)
+      "ok"      a bare "OK" — the heartbeat ack, or any bodyless success
+      "status"  a GET reply (payload: parse_get_reply()'s dict)
+      "ack"     a single-command ack that changed an output; follow with GET
+      "log"     anything else — ERR, FAULT, ID, VERIFY, STATUS, DUMP ...
+    """
+    if line.startswith("!"):
+        return "event", line
+    if line == "OK":
+        return "ok", None
+    if not line.startswith("OK "):
+        return "log", None
+    body = line[3:].strip()
+
+    # DUMP: "ch1=<code>,<dacX>,<ainN>,<adc code>,<mon V> ; ..." — raw view,
+    # log only. Checked before the generic "ch" ack test below.
+    if body.startswith("ch1=") and "," in body:
+        return "log", None
+
+    # P -> "VAC1 p=-40.00 v=5.000"; V/C/SET -> "ch1 v=5.000 code=1926";
+    # ZERO -> "all zero"; STOP -> "stopped"; START/CLEARFAULT -> "ready".
+    # Each changes the outputs, so pull a full status afterwards to keep
+    # every panel in step, including the ones the command did not touch.
+    if (" p=" in body and " v=" in body) or body.startswith("ch") \
+            or body in ("all zero", "stopped", "ready"):
+        return "ack", None
+
+    status = parse_get_reply(body)
+    if status:
+        return "status", status
+    return "log", None
+
+
+_STATE_RE = re.compile(r"\bstate=([A-Za-z]+)")
+
+
+def reply_state(line):
+    """Board state named in an ID or STATUS reply ("state=READY"), or None."""
+    match = _STATE_RE.search(line)
+    return match.group(1).upper() if match else None
+
+
 # --- test profiles -------------------------------------------------------
 #
 # A profile is a JSON file describing a sequence of held setpoints, so a long
@@ -82,16 +194,18 @@ def fmt_hms(seconds):
 #     "zero_on_finish": true,         optional, default true
 #     "steps": [
 #       {"label": "pressurise", "hold_s": 30,
-#        "set": [{"reg": 0, "kPa": 100}]},
+#        "set": [{"reg": 4, "kPa": 100}]},
 #       {"label": "soak",       "hold_s": 600,
-#        "set": [{"reg": 0, "kPa": 100}, {"reg": 1, "kPa": -40}]},
+#        "set": [{"reg": 4, "kPa": 100}, {"reg": 1, "kPa": -40}]},
 #       {"label": "vent",       "hold_s": 15, "set": []}
 #     ]
 #   }
 #
-# A "set" entry is either {"reg": 0-3, "kPa": <pressure>} for the pressure
-# layer, or {"ch": 0-15, "volts": <volts>} to drive a DAC channel directly.
-# An empty "set" holds whatever the previous step left in place.
+# A "set" entry is either {"reg": 1-4, "kPa": <pressure>} for the pressure
+# layer (P command), or {"ch": 1-4, "volts": <volts>} to drive a channel's
+# valve voltage directly (V command). Channels are 1-indexed like the board
+# silkscreen: 1-3 are the vacuum units, 4 is air. An empty "set" holds
+# whatever the previous step left in place.
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
 
@@ -105,6 +219,14 @@ def _require_number(value, where, field):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{where}: '{field}' must be a number")
     return float(value)
+
+
+def _require_channel(value, where, field):
+    """Return value as a channel number 1..NUM_CHANNELS, or raise."""
+    if not isinstance(value, int) or isinstance(value, bool) \
+            or not 1 <= value <= NUM_CHANNELS:
+        raise ValueError(f"{where}: '{field}' must be 1..{NUM_CHANNELS}")
+    return value
 
 
 def _validate_step(step, i):
@@ -126,12 +248,9 @@ def _validate_step(step, i):
             raise ValueError(f"{where}: every 'set' entry must be a JSON object")
 
         if "reg" in entry:
-            reg = entry["reg"]
-            if not isinstance(reg, int) or isinstance(reg, bool) \
-                    or not 0 <= reg < len(REGULATORS):
-                raise ValueError(f"{where}: 'reg' must be 0..{len(REGULATORS) - 1}")
+            reg = _require_channel(entry["reg"], where, "reg")
             value = _require_number(entry.get("kPa"), where, "kPa")
-            _, p_at_0v, p_at_10v, unit, _ = REGULATORS[reg]
+            _, _, p_at_0v, p_at_10v, unit, _ = REGULATORS[reg - 1]
             lo, hi = min(p_at_0v, p_at_10v), max(p_at_0v, p_at_10v)
             if not lo <= value <= hi:
                 raise ValueError(
@@ -140,10 +259,7 @@ def _validate_step(step, i):
             actions.append(("P", reg, value))
 
         elif "ch" in entry:
-            channel = entry["ch"]
-            if not isinstance(channel, int) or isinstance(channel, bool) \
-                    or not 0 <= channel <= 15:
-                raise ValueError(f"{where}: 'ch' must be 0..15")
+            channel = _require_channel(entry["ch"], where, "ch")
             value = _require_number(entry.get("volts"), where, "volts")
             if not VOLT_MIN <= value <= VOLT_MAX:
                 raise ValueError(
@@ -247,10 +363,10 @@ class SerialLink:
 class RegulatorPanel(ttk.LabelFrame):
     """One regulator: presets, manual pressure, manual voltage, readback."""
 
-    def __init__(self, master, index, name, p_at_0v, p_at_10v, unit,
+    def __init__(self, master, channel, name, p_at_0v, p_at_10v, unit,
                  presets, on_set_pressure, on_set_voltage):
-        super().__init__(master, text=f" {index}:  {name} ")
-        self.index = index
+        super().__init__(master, text=f" CH{channel}  {name} ")
+        self.channel = channel
         self.unit = unit
         self.p_at_0v = p_at_0v
         self.p_at_10v = p_at_10v
@@ -266,7 +382,7 @@ class RegulatorPanel(ttk.LabelFrame):
         ttk.Label(
             self,
             text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}\n"
-                  f"DAC      {VOLT_MIN:g} … {VOLT_MAX:g} V"),
+                  f"Valve    {VOLT_MIN:g} … {VOLT_MAX:g} V"),
             justify="left",
         ).grid(row=0, column=0, columnspan=5, padx=10, pady=(6, 4), sticky="w")
 
@@ -318,10 +434,10 @@ class RegulatorPanel(ttk.LabelFrame):
         v_button.grid(row=3, column=3, padx=(4, 2), sticky="w")
         self.controls += [self.v_entry, v_button]
 
-        self.readback = ttk.Label(self, text="commanded    —", foreground="#444",
-                                  justify="left")
+        self.readback = ttk.Label(self, foreground="#444", justify="left")
         self.readback.grid(row=4, column=0, columnspan=5, padx=10, pady=(6, 2),
                            sticky="w")
+        self.show_readback("—", "—", "—")
         self.msg = ttk.Label(self, text="", foreground="#a00")
         self.msg.grid(row=5, column=0, columnspan=5, padx=10, pady=(0, 6), sticky="w")
 
@@ -330,10 +446,10 @@ class RegulatorPanel(ttk.LabelFrame):
     def voltage_for(self, pressure):
         """Command voltage for a pressure setpoint.
 
-        Mirrors setPressure() in lib/PressureControl/PressureControl.cpp, so
-        the voltage shown on a preset is the one the firmware will actually
-        program. If the calibration is changed there (or via CAL), the
-        REGULATORS table here has to move with it.
+        Mirrors the firmware's P command (linear between the CAL PRESS
+        endpoints), so the voltage shown on a preset is the one the firmware
+        will actually program. If the calibration is changed there (CAL
+        PRESS / CAL SAVE), the REGULATORS table here has to move with it.
         """
         span = self.p_at_10v - self.p_at_0v
         return VOLT_MIN + (pressure - self.p_at_0v) * (VOLT_MAX - VOLT_MIN) / span
@@ -356,7 +472,7 @@ class RegulatorPanel(ttk.LabelFrame):
         value = self.clamp(value, self.p_lo, self.p_hi, self.unit)
         self.p_entry.delete(0, "end")
         self.p_entry.insert(0, f"{value:g}")
-        self.on_set_pressure(self.index, value)
+        self.on_set_pressure(self.channel, value)
 
     def apply_pressure_entry(self):
         value = to_float(self.p_entry.get())
@@ -373,7 +489,7 @@ class RegulatorPanel(ttk.LabelFrame):
         value = self.clamp(value, VOLT_MIN, VOLT_MAX, "V")
         self.v_entry.delete(0, "end")
         self.v_entry.insert(0, f"{value:.3f}")
-        self.on_set_voltage(self.index, value)
+        self.on_set_voltage(self.channel, value)
 
     def set_enabled(self, enabled):
         """Lock the manual controls while a profile is driving this channel."""
@@ -389,7 +505,7 @@ class RegulatorPanel(ttk.LabelFrame):
         the vacuum units) instead of the GUI reporting an out-of-range value.
         """
         self.reset_fields()
-        self.on_set_pressure(self.index, 0.0)
+        self.on_set_pressure(self.channel, 0.0)
 
     def reset_fields(self):
         self.p_entry.delete(0, "end")
@@ -398,9 +514,14 @@ class RegulatorPanel(ttk.LabelFrame):
         self.v_entry.insert(0, "0.000")
         self.warn()
 
-    def show_readback(self, pressure, volts):
+    def show_readback(self, pressure, volts, monitor):
+        """Fill the readback from one GET field triple (strings as reported)."""
+        if monitor != "—":
+            monitor = monitor_text(monitor, self.p_at_0v, self.p_at_10v, self.unit)
         self.readback.config(
-            text=f"commanded    {pressure} {self.unit}\nDAC          {volts} V")
+            text=(f"commanded    {pressure} {self.unit}\n"
+                  f"valve        {volts} V\n"
+                  f"monitor      {monitor}"))
 
 
 class ProfileRunner:
@@ -460,11 +581,11 @@ class ProfileRunner:
             f"# loop {self.loop}/{self.profile['loops']} "
             f"step {self.index + 1}/{len(self.steps)} "
             f"'{step['label']}' — hold {fmt_hms(step['hold_s'])}")
-        for kind, target, value in step["actions"]:
+        for kind, channel, value in step["actions"]:
             if kind == "P":
-                self.app.set_pressure(target, value)
+                self.app.set_pressure(channel, value)
             else:
-                self.app.set_voltage_channel(target, value)
+                self.app.set_voltage(channel, value)
 
         self.deadline = time.monotonic() + step["hold_s"]
         self._tick()
@@ -490,7 +611,7 @@ class App(tk.Tk):
         self.title("SRFM Regulator Control")
         self.resizable(False, False)
         # One column per regulator; every other widget spans the full width.
-        span = len(REGULATORS)
+        span = NUM_CHANNELS
         for column in range(span):
             self.columnconfigure(column, weight=1, uniform="panel")
 
@@ -498,6 +619,8 @@ class App(tk.Tk):
         self.link = SerialLink(self.rx_queue.put)
         self.runner = None
         self._refresh_job = None
+        self._hb_job = None
+        self._hb_pending = 0  # HB acks still to arrive (and be dropped from the log)
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -511,26 +634,38 @@ class App(tk.Tk):
         self.connect_btn.pack(side="left", padx=6)
         self.status = ttk.Label(bar, text="disconnected", foreground="#a00")
         self.status.pack(side="left", padx=6)
+        # Board state: the latest !READY / !FAULT event, or the state named in
+        # an ID / STATUS reply.
+        self.board = ttk.Label(bar, text="", foreground="#444")
+        self.board.pack(side="left", padx=6)
 
-        # --- regulator panels, one per column ---
-        self.panels = []
-        for i, (name, p_at_0v, p_at_10v, unit, presets) in enumerate(REGULATORS):
-            panel = RegulatorPanel(self, i, name, p_at_0v, p_at_10v, unit, presets,
+        # --- regulator panels, one per column, in channel order ---
+        self.panels = {}
+        for i, (fw_name, name, p_at_0v, p_at_10v, unit, presets) in enumerate(REGULATORS):
+            panel = RegulatorPanel(self, i + 1, name, p_at_0v, p_at_10v, unit, presets,
                                    self.set_pressure, self.set_voltage)
             panel.grid(row=1, column=i, padx=(8 if i == 0 else 4, 8), pady=4,
                        sticky="nsew")
-            self.panels.append(panel)
+            self.panels[fw_name] = panel
 
         # --- bottom bar ---
         bottom = ttk.Frame(self)
         bottom.grid(row=2, column=0, columnspan=span, sticky="ew", padx=8, pady=(4, 8))
         ttk.Button(bottom, text="ZERO ALL", command=self.zero_all).pack(side="left")
-        ttk.Button(bottom, text="Refresh status",
-                   command=lambda: self.send_cmd("GET")).pack(side="left", padx=6)
-        ttk.Button(bottom, text="Verify SPI",
-                   command=lambda: self.send_cmd("VERIFY")).pack(side="left")
-        ttk.Button(bottom, text="Dump DAC",
-                   command=lambda: self.send_cmd("DUMP")).pack(side="left", padx=6)
+        for label, command in (("GET", "GET"), ("VERIFY", "VERIFY"),
+                               ("DUMP", "DUMP"), ("STATUS", "STATUS")):
+            ttk.Button(bottom, text=label,
+                       command=lambda c=command: self.send_cmd(c)).pack(
+                side="left", padx=(6, 0))
+        # Board power: STOP drops the 24 V rail, START brings it back,
+        # CLEARFAULT is the only way out of a latched eFuse fault.
+        ttk.Button(bottom, text="STOP", command=self.stop_board).pack(
+            side="left", padx=(18, 0))
+        ttk.Button(bottom, text="START",
+                   command=lambda: self.send_cmd("START")).pack(side="left", padx=(6, 0))
+        ttk.Button(bottom, text="CLEARFAULT",
+                   command=lambda: self.send_cmd("CLEARFAULT")).pack(
+            side="left", padx=(6, 0))
 
         # --- test profile bar ---
         script = ttk.LabelFrame(self, text=" Test profile ")
@@ -566,13 +701,7 @@ class App(tk.Tk):
 
     def toggle_connect(self):
         if self.link.connected:
-            # Never leave a profile running against a port that is about to
-            # close; it would keep ticking and log a send failure per step.
-            if self.runner is not None:
-                self.runner.stop("stopped — port disconnected")
-            self.link.disconnect()
-            self.status.config(text="disconnected", foreground="#a00")
-            self.connect_btn.config(text="Connect")
+            self.disconnect_link("port disconnected")
             return
         port = self.port_var.get().strip()
         if not port:
@@ -585,13 +714,29 @@ class App(tk.Tk):
             return
         self.status.config(text=f"connected {port}", foreground="#080")
         self.connect_btn.config(text="Disconnect")
-        # Opening the port resets the Mega; give it a moment then identify.
-        self.after(2500, lambda: self.send_cmd("ID"))
-        self.after(2700, lambda: self.send_cmd("GET"))
+        # The XIAO does not reset when the port opens; a short settle is
+        # enough before identifying it and reading the current setpoints.
+        self.after(CONNECT_SETTLE_MS, lambda: self.send_if_connected("ID"))
+        self.after(CONNECT_SETTLE_MS + 200, lambda: self.send_if_connected("GET"))
+        self._hb_pending = 0
+        self._hb_job = self.after(HEARTBEAT_MS, self.heartbeat)
+
+    def disconnect_link(self, reason):
+        """Close the port, stopping whatever depends on it first."""
+        self.stop_heartbeat()
+        # Never leave a profile running against a port that is about to
+        # close; it would keep ticking and log a send failure per step.
+        if self.runner is not None:
+            self.runner.stop(f"stopped — {reason}")
+        self.link.disconnect()
+        self.status.config(text="disconnected", foreground="#a00")
+        self.board.config(text="", foreground="#444")
+        self.connect_btn.config(text="Connect")
 
     def on_close(self):
         if self.runner is not None:
             self.runner.stop("stopped — window closed")
+        self.stop_heartbeat()
         if self.link.connected:
             try:
                 self.link.send("ZERO")
@@ -599,6 +744,29 @@ class App(tk.Tk):
                 pass
             self.link.disconnect()
         self.destroy()
+
+    # --- heartbeat ---
+
+    def heartbeat(self):
+        """Send HB and reschedule. Not logged: one line a second would bury
+        everything else, so the HB and its bare OK are both kept out."""
+        self._hb_job = None
+        if not self.link.connected:
+            return
+        try:
+            self.link.send("HB")
+        except (RuntimeError, serial.SerialException) as exc:
+            self.log_line(f"! heartbeat failed: {exc}")
+            self.disconnect_link("port lost")
+            return
+        self._hb_pending += 1
+        self._hb_job = self.after(HEARTBEAT_MS, self.heartbeat)
+
+    def stop_heartbeat(self):
+        if self._hb_job is not None:
+            self.after_cancel(self._hb_job)
+            self._hb_job = None
+        self._hb_pending = 0
 
     # --- commands ---
 
@@ -611,15 +779,15 @@ class App(tk.Tk):
         except (RuntimeError, serial.SerialException) as exc:
             self.log_line(f"! send failed: {exc}")
 
-    def set_pressure(self, index, value):
-        self.send_cmd(f"P {index} {value:.2f}")
+    def send_if_connected(self, line):
+        """For deferred sends: stay quiet if the port went away meanwhile."""
+        if self.link.connected:
+            self.send_cmd(line)
 
-    def set_voltage(self, index, volts):
-        # Regulator index equals its DAC channel (see the channel table in
-        # README.md and the dacChannel field in PressureControl.h).
-        self.set_voltage_channel(index, volts)
+    def set_pressure(self, channel, value):
+        self.send_cmd(f"P {channel} {value:.2f}")
 
-    def set_voltage_channel(self, channel, volts):
+    def set_voltage(self, channel, volts):
         self.send_cmd(f"V {channel} {volts:.3f}")
 
     def request_status(self, delay_ms=120):
@@ -637,6 +805,24 @@ class App(tk.Tk):
         self._refresh_job = None
         self.send_cmd("GET")
 
+    def zero_all(self):
+        for panel in self.panels.values():
+            panel.reset_fields()
+        self.send_cmd("ZERO")
+        self.request_status()
+
+    def stop_board(self):
+        """STOP: every output to zero, then the 24 V rail off.
+
+        A running profile is ended first — its setpoints would only be
+        refused with ERR once the board is STOPPED. START brings it back.
+        """
+        if self.runner is not None:
+            self.runner.stop("stopped — board STOP")
+        for panel in self.panels.values():
+            panel.reset_fields()
+        self.send_cmd("STOP")
+
     # --- test profiles ---
 
     def choose_profile(self):
@@ -645,7 +831,7 @@ class App(tk.Tk):
         if not self.link.connected:
             messagebox.showwarning(
                 "Not connected",
-                "Connect to the Mega before running a test profile.")
+                "Connect to the controller before running a test profile.")
             return
         path = filedialog.askopenfilename(
             title="Select a test profile",
@@ -664,7 +850,7 @@ class App(tk.Tk):
         self.start_profile(profile)
 
     def start_profile(self, profile):
-        for panel in self.panels:
+        for panel in self.panels.values():
             panel.set_enabled(False)
         self.script_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -677,7 +863,7 @@ class App(tk.Tk):
 
     def on_profile_finished(self):
         self.runner = None
-        for panel in self.panels:
+        for panel in self.panels.values():
             panel.set_enabled(True)
         self.script_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
@@ -686,49 +872,50 @@ class App(tk.Tk):
     def show_profile_progress(self, text):
         self.profile_label.config(text=text)
 
-    def zero_all(self):
-        for panel in self.panels:
-            panel.reset_fields()
-        self.send_cmd("ZERO")
-        self.request_status()
-
     # --- receive path ---
 
     def poll_rx(self):
         try:
             while True:
-                line = self.rx_queue.get_nowait()
-                self.log_line(f"< {line}")
-                self.parse_status(line)
+                self.handle_line(self.rx_queue.get_nowait())
         except queue.Empty:
             pass
         self.after(50, self.poll_rx)
 
-    def parse_status(self, line):
-        if not line.startswith("OK "):
+    def handle_line(self, line):
+        kind, payload = classify_reply(line)
+        if kind == "ok" and self._hb_pending > 0:
+            # The heartbeat's ack — replies arrive in command order, so the
+            # next bare OK after an HB is its own. Dropped, not logged.
+            self._hb_pending -= 1
             return
-        body = line[3:].strip()
-
-        # DUMP output ("ch0=16384,2.500V,s1; ...") is for the log only.
-        if body.startswith("ch0=") and ",s" in body:
-            return
-
-        # Single-command acks from P ("AIR p=.. v=..") and V/C ("ch0 v=.. code=..").
-        # Pull a full status afterwards so every panel stays in step, including
-        # the ones the command did not touch.
-        if (" p=" in body and " v=" in body) or body.startswith("ch"):
+        self.log_line(f"< {line}")
+        if kind == "event":
+            self.show_event(line)
+        elif kind == "ack":
             self.request_status()
-            return
+        elif kind == "status":
+            self.show_status(payload)
+        else:
+            state = reply_state(line)
+            if state:
+                self.show_state(state)
 
-        # Full status: "AIR=250.50,5.000V; VAC1=-1.30,0.000V; ..."
-        if "=" in body and "," in body:
-            for i, part in enumerate(p.strip() for p in body.split(";")):
-                if i >= len(self.panels) or "=" not in part:
-                    continue
-                _, _, rhs = part.partition("=")
-                pressure, _, volts = rhs.partition(",")
-                self.panels[i].show_readback(
-                    pressure.strip(), volts.strip().rstrip("V"))
+    def show_status(self, status):
+        for name, (pressure, volts, monitor) in status.items():
+            self.panels[name].show_readback(pressure, volts, monitor)
+
+    def show_event(self, line):
+        """Keep the latest !FAULT / !READY line in the bar; other events log only."""
+        head = line.split()[0].upper() if line.split() else ""
+        if head == "!FAULT":
+            self.board.config(text=line, foreground="#a00")
+        elif head == "!READY":
+            self.board.config(text=line, foreground="#080")
+
+    def show_state(self, state):
+        colour = "#080" if state == "READY" else "#a00"
+        self.board.config(text=f"state {state}", foreground=colour)
 
     def log_line(self, text):
         self.log.config(state="normal")

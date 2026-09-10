@@ -1,42 +1,50 @@
 #include "PressureControl.h"
+#include <math.h>
 
-void PressureController::begin(LTC2668 *dac)
+namespace PressureControl
 {
-  _dac = dac;
-  zeroAll();
-}
 
-float PressureController::setPressure(uint8_t reg, float pressure)
+float clampPressure(const ChannelCal &c, float p)
 {
-  if (reg >= NUM_REGULATORS || _dac == nullptr) return NAN;
-  const RegulatorConfig &c = _cfg[reg];
-
-  // Clamp to the calibrated range; handles vacuum configs where pMin > pMax.
   float lo = min(c.pMin, c.pMax);
   float hi = max(c.pMin, c.pMax);
-  if (pressure < lo) pressure = lo;
-  if (pressure > hi) pressure = hi;
-
-  float volts = c.vMin + (pressure - c.pMin) * (c.vMax - c.vMin) / (c.pMax - c.pMin);
-  _voltage[reg] = _dac->setVoltage(c.dacChannel, volts);
-  _setpoint[reg] = pressure;
-  return pressure;
+  if (p < lo) p = lo;
+  if (p > hi) p = hi;
+  return p;
 }
 
-void PressureController::zeroAll()
+float pressureToVolts(const ChannelCal &c, float p)
 {
-  for (uint8_t i = 0; i < NUM_REGULATORS; i++) setPressure(i, 0.0);
+  p = clampPressure(c, p);
+  float v = c.vMin + (p - c.pMin) * (c.vMax - c.vMin) / (c.pMax - c.pMin);
+  if (v < 0.0f) v = 0.0f;
+  if (v > VALVE_VOLTS_MAX) v = VALVE_VOLTS_MAX;
+  return v;
 }
 
-bool PressureController::setCalibration(uint8_t reg, float vMin, float vMax, float pMin, float pMax)
+float voltsToPressure(const ChannelCal &c, float v)
 {
-  if (reg >= NUM_REGULATORS) return false;
-  if (vMin == vMax || pMin == pMax) return false;  // degenerate mapping
-  _cfg[reg].vMin = vMin;
-  _cfg[reg].vMax = vMax;
-  _cfg[reg].pMin = pMin;
-  _cfg[reg].pMax = pMax;
-  // Re-apply the current setpoint under the new calibration.
-  setPressure(reg, _setpoint[reg]);
-  return true;
+  return c.pMin + (v - c.vMin) * (c.pMax - c.pMin) / (c.vMax - c.vMin);
 }
+
+uint16_t fractionToCode(const ChannelCal &c, float fraction)
+{
+  if (fraction < 0.0f) fraction = 0.0f;
+  if (fraction > 1.0f) fraction = 1.0f;
+  float code = roundf(fraction * (float)c.codeFullScale);
+  if (code > (float)c.codeFullScale) code = (float)c.codeFullScale;
+  return (uint16_t)code;
+}
+
+float codeToFraction(const ChannelCal &c, uint16_t code)
+{
+  if (c.codeFullScale == 0) return 0.0f;
+  return (float)code / (float)c.codeFullScale;
+}
+
+float adcCodeToMonitorVolts(const ChannelCal &c, int16_t code)
+{
+  return (float)(code - c.rbOffset) * c.rbGain_mV / 1000.0f;
+}
+
+}  // namespace PressureControl
