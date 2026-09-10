@@ -20,9 +20,13 @@ void ValveConfigStore::setDefaults()
 {
   memset(&_cfg, 0, sizeof(_cfg));
 
-  // Expected physical map from the Gerber review (FIRMWARE_HANDOFF section 5):
-  // CH1 -> VOUT B / AIN3, CH2 -> VOUT A / AIN2, CH3 -> VOUT C / AIN1, CH4 -> VOUT D / AIN0.
-  static const uint8_t DAC_ADDR[VALVE_NUM_CHANNELS] = { 1, 0, 2, 3 };
+  // Physical map from the SRFMV1 netlist (SRFMV1/SRFMV1.tel), confirmed on
+  // the bench 2026-09-10 (VOUTB measured on the CH3 pads):
+  //   CH1 -> VOUT C (R18) / AIN3,  CH2 -> VOUT D (R19) / AIN2,
+  //   CH3 -> VOUT B (R20) / AIN1,  CH4 -> VOUT A (R21) / AIN0.
+  // The Gerber-review guess in FIRMWARE_HANDOFF section 5 (B, A, C, D) was wrong
+  // for the DAC side; the ADC side matched.
+  static const uint8_t DAC_ADDR[VALVE_NUM_CHANNELS] = { 2, 3, 1, 0 };
   static const uint8_t ADC_IN[VALVE_NUM_CHANNELS]   = { 3, 2, 1, 0 };
 
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++)

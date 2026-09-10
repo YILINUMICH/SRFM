@@ -78,20 +78,19 @@ deliberately and in order. Full detail, bus settings and register values:
 Channels are **1-indexed CH1–CH4** in every host message, matching the
 silkscreen.
 
-| CH | Valve | Firmware name | 0–10 V at the valve maps to | Expected DAC output | Expected ADC input |
+| CH | Valve | Firmware name | 0–10 V at the valve maps to | DAC output (series R) | ADC input |
 |---|---|---|---|---|---|
-| 1 | SMC ITV2090-312L5 (vacuum) | `VAC1` | −1.3 … −80 kPa | VOUT **B** | AIN **3** |
-| 2 | SMC ITV2090-312L5 (vacuum) | `VAC2` | −1.3 … −80 kPa | VOUT **A** | AIN **2** |
-| 3 | SMC ITV2090-312L5 (vacuum) | `VAC3` | −1.3 … −80 kPa | VOUT C | AIN **1** |
-| 4 | SMC ITV0030-3BL (air pressure) | `AIR` | +1 … +500 kPa | VOUT D | AIN **0** |
+| 1 | SMC ITV2090-312L5 (vacuum) | `VAC1` | −1.3 … −80 kPa | VOUT **C** (R18) | AIN **3** |
+| 2 | SMC ITV2090-312L5 (vacuum) | `VAC2` | −1.3 … −80 kPa | VOUT **D** (R19) | AIN **2** |
+| 3 | SMC ITV2090-312L5 (vacuum) | `VAC3` | −1.3 … −80 kPa | VOUT **B** (R20) | AIN **1** |
+| 4 | SMC ITV0030-3BL (air pressure) | `AIR` | +1 … +500 kPa | VOUT **A** (R21) | AIN **0** |
 
-> **The physical map above is a prediction, not a measurement.** It comes
-> from the Gerber review (FIRMWARE_HANDOFF §5): the board is *not* wired in
-> order — VOUTA/VOUTB are swapped and AIN0–AIN3 are fully reversed relative to
-> the older docs. It must be **confirmed on the assembled board** with the
-> bring-up steps below and entered with `CAL MAP` + `CAL SAVE`. What you
-> measure wins; the firmware ships with this table as its default (`ID` shows
-> `map=BACD/3210`).
+> **The physical map above is verified.** It comes from the SRFMV1 netlist
+> (`SRFMV1/SRFMV1.tel`: VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3,
+> VOUTA→R21→CMD4; AIN3…AIN0 ← RD1…RD4) and was confirmed on the bench on
+> 2026-09-10 (VOUTB measured on the CH3 pads). It is the firmware default
+> (`map=CDBA/3210`). The Gerber-review prediction in FIRMWARE_HANDOFF §5
+> (`BACD`) was wrong on the DAC side.
 
 CH4's ITV0030-3BL may have no monitor output at all. Its readback can be
 disabled (`CAL RBEN 4 0`), in which case it reports `n/a` and never raises an
@@ -157,7 +156,7 @@ pio device monitor                  # 115200 (CDC ignores the baud)
 
 The boot-time `!READY` / `!FAULT` line is printed before USB is up, so you
 will not see it; `STATUS` shows the same information (`state=READY`,
-`dac=0x001F`), and `START` prints a fresh `!READY ch1=… ch4=…`. Type `ID` → `OK SRFM-PCB v2.0 state=READY map=BACD/3210
+`dac=0x001F`), and `START` prints a fresh `!READY ch1=… ch4=…`. Type `ID` → `OK SRFM-PCB v2.0 state=READY map=CDBA/3210
 cal=… hb=2`. Type `VERIFY` → `OK verify=yes pc=0x001F` proves the SPI link to
 the DAC. Ctrl-C to quit, and make sure the monitor *is* closed before starting
 the GUI: only one program can hold the port.
@@ -286,7 +285,7 @@ CAL MAP 3 C 1
 CAL MAP 4 D 0
 CAL RBEN 4 0           ← only if the CH4 ITV0030 has no monitor and stays near 0
 CAL SAVE               → OK saved
-ID                     → … map=BACD/3210 cal=ok …
+ID                     → … map=CDBA/3210 cal=ok …
 ```
 
 **5. Loopback sanity.** Get the board into `READY` (`STATUS` shows the state;
@@ -362,7 +361,7 @@ flash (LittleFS `/srfm_cal.bin`, versioned with a CRC), not code:
 
 | Term | `CAL` command | Default | What it corrects |
 |---|---|---|---|
-| Channel map | `CAL MAP <ch> <A-D> <0-3>` | `BACD/3210` | which DAC output / ADC input serves each logical channel |
+| Channel map | `CAL MAP <ch> <A-D> <0-3>` | `CDBA/3210` | which DAC output / ADC input serves each logical channel |
 | Full-scale code | `CAL FS <ch> <code>` | 3851 (CH1–3), 3831 (CH4) | DAC code that puts 10.000 V at the valve through the 100 Ω series resistor. Measure at valve pin 2 with a DMM; never commanded above |
 | Readback gain/offset | `CAL RB <ch> <mV_per_code> <offset>` | 3.19 mV, 0 | monitor divider + ADC input impedance. Fit against a DMM at valve pin 4 at ~50 % and ~100 % |
 | Readback enable | `CAL RBEN <ch> <0\|1>` | 1 | 0 → monitor reported as `n/a`, no open-load fault |

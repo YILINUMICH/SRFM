@@ -163,6 +163,8 @@ static void wdtStart()
 
 static inline void wdtKick() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
 
+extern "C" void __wrap_enterSerialDfu(void);   // defined below, before setup()
+
 // --- DAC / valve command path ------------------------------------------
 static void applyCode(uint8_t i, uint16_t code)
 {
@@ -642,11 +644,19 @@ static void cmdCal(char *sub)
     uint8_t addr; long in;
     if (!parseDacAddr(strtok(nullptr, " \t"), &addr) || !parseLong(strtok(nullptr, " \t"), &in) || in < 0 || in > 3)
     { printfln("ERR usage: CAL MAP <ch> <A-D> <0-3>"); return; }
+    // Re-point the channel. If another channel already owns the requested
+    // DAC output it takes this channel's old output (a swap), so any
+    // permutation can be entered one line at a time. Both outputs are
+    // zeroed first so no valve is left holding a command nobody owns.
+    uint8_t oldAddr = k.dacAddr;
+    dac.writeCode(oldAddr, 0);
+    dac.writeCode(addr, 0);
     for (uint8_t j = 0; j < VALVE_NUM_CHANNELS; j++)
-      if (j != i && cal(j).dacAddr == addr) { printfln("ERR dac %c already used by ch%u", 'A' + addr, j + 1); return; }
-    // Re-point the channel: zero the old physical output first so no valve
-    // is left holding a command nobody owns.
-    dac.writeCode(k.dacAddr, 0);
+      if (j != i && cal(j).dacAddr == addr)
+      {
+        cal(j).dacAddr = oldAddr;
+        applyCode(j, chan[j].code);
+      }
     k.dacAddr = addr;
     k.adcInput = (uint8_t)in;
     applyCode(i, chan[i].code);
@@ -827,12 +837,32 @@ static void handleLine(char *line)
       }
     printfln("OK dac%c code=%ld vdac=%.3f", 'A' + addr, code, AD5724R::codeToDacVolts((uint16_t)code));
   }
+  else if (strcmp(cmd, "RAWGET") == 0)
+  {
+    // Read the DAC's own registers for one output: what code it holds and
+    // which range it is in. Proves a RAW write landed even if no voltage
+    // shows at the pads (which would then point at AVDD or the output stage).
+    uint8_t addr;
+    if (!parseDacAddr(strtok(nullptr, " \t"), &addr)) { printfln("ERR usage: RAWGET <A-D>"); return; }
+    uint16_t code = dac.readCode(addr);
+    uint16_t range = dac.readRegister(AD5724R_REG_RANGE, addr) & 0x07;
+    uint16_t func = dac.readRegister(AD5724R_REG_CONTROL, AD5724R_CTRL_FUNCTION) & 0x0F;
+    printfln("OK dac%c code=%u range=%u func=0x%X vdac=%.3f", 'A' + addr, code, range, func,
+             AD5724R::codeToDacVolts(code));
+  }
   else if (strcmp(cmd, "ADC") == 0)
   {
     long in; int16_t code;
     if (!parseLong(strtok(nullptr, " \t"), &in) || in < 0 || in > 3) { printfln("ERR usage: ADC <0-3>"); return; }
     if (!adc.readAveraged((uint8_t)in, ADC_AVERAGE, &code)) { printfln("ERR ADS1015 no response"); return; }
     printfln("OK ain%ld code=%d v=%.3f", in, code, ADS1015::codeToVolts(code));
+  }
+  else if (strcmp(cmd, "DFU") == 0)
+  {
+    printfln("OK entering bootloader");
+    Serial.flush();
+    delay(50);
+    __wrap_enterSerialDfu();
   }
   else if (strcmp(cmd, "HANG") == 0)
   {
@@ -843,9 +873,54 @@ static void handleLine(char *line)
   else printfln("ERR unknown command: %s", cmd);
 }
 
+// --- entering the bootloader with the watchdog running ---------------------
+// The nRF52 WDT keeps running through the soft reset the core uses for the
+// 1200-baud touch, the XIAO's stock bootloader (0.6.1) does not feed it, and
+// a watchdog reset wipes GPREGRET (the bootloader's DFU-request register), so
+// neither a plain soft reset nor "set the magic and let the WDT fire" reaches
+// serial DFU. What works is a double hop:
+//   1. put the board in its safe state, leave a request word in .noinit RAM
+//      (RAM survives a watchdog reset), stop kicking -> watchdog reset, which
+//      is the one reset that stops the WDT;
+//   2. the freshly booted firmware sees the request before it starts
+//      anything, clears it and performs the core's normal soft reset into the
+//      bootloader with the WDT now off.
+// The core's enterSerialDfu() is redirected here with -Wl,--wrap (platformio.ini)
+// so the 1200-baud touch from `pio run -t upload` takes the same path as the
+// DFU host command.
+static const uint32_t DFU_REQUEST_MAGIC = 0x44465521UL;   // "DFU!"
+static uint32_t dfuRequest __attribute__((section(".noinit")));
+
+extern "C" void __real_enterSerialDfu(void);
+extern "C" void __wrap_enterSerialDfu(void)
+{
+  // Safe state first, in the shutdown order.
+  if (dac.clearReleased()) { for (uint8_t a = 0; a < AD5724R_NUM_OUTPUTS; a++) dac.writeCode(a, 0); }
+  digitalWrite(PIN_EFUSE_SHDN, LOW);
+  dac.clearAssert();
+  if (!(NRF_WDT->RUNSTATUS & WDT_RUNSTATUS_RUNSTATUS_Msk)) { __real_enterSerialDfu(); }
+  dfuRequest = DFU_REQUEST_MAGIC;
+  __disable_irq();
+  for (;;) { }                  // watchdog reset within WDT_TIMEOUT_MS
+}
+
+static void honourDfuRequest()
+{
+  bool wdtReset = (NRF_POWER->RESETREAS & POWER_RESETREAS_DOG_Msk) != 0;
+  if (dfuRequest == DFU_REQUEST_MAGIC)
+  {
+    dfuRequest = 0;
+    if (wdtReset) __real_enterSerialDfu();   // never returns
+  }
+  dfuRequest = 0;
+  if (wdtReset) NRF_POWER->RESETREAS = POWER_RESETREAS_DOG_Msk;   // write-1-to-clear
+}
+
 // --- setup / loop ----------------------------------------------------------
 void setup()
 {
+  honourDfuRequest();   // before the watchdog starts: second hop of a DFU request
+
   // 1. GPIOs first, reproducing the pull-defined safe state explicitly.
   digitalWrite(PIN_EFUSE_SHDN, LOW);
   pinMode(PIN_EFUSE_SHDN, OUTPUT);

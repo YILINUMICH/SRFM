@@ -127,7 +127,7 @@ The `REGULATORS` table must still be kept in sync with `CAL PRESS` by hand.
 | **Strict boot order**, rail enabled last, and only after the DAC readback proves the SPI link | Valves see 24 V only when their command is already a verified 0 V. A wrong SPI mode or a stuck CLR can never result in an uncontrolled valve. |
 | **Stop order: codes to 0, then SHDN low** | An ITV vents on 0 V; cutting 24 V first leaves output pressure "retained temporarily and not guaranteed" (SMC). |
 | **SPI mode 2 with register readback as proof** | Matches the AD5724R timing diagram; mode 1 will usually also work. `VERIFY`/`SPIMODE` let the bench settle it without a rebuild. |
-| **Channel map is data** (`CAL MAP`, in ValveConfig) | Gerber review found VOUTA/B swapped and AIN0–3 reversed vs. the design docs; the assembled board decides. A board spin or re-ordered valve is a config change. Default `BACD/3210`. |
+| **Channel map is data** (`CAL MAP`, in ValveConfig) | Gerber review found VOUTA/B swapped and AIN0–3 reversed vs. the design docs; the assembled board decides. A board spin or re-ordered valve is a config change. Default `CDBA/3210`, from the SRFMV1 netlist and confirmed on the bench 2026-09-10. |
 | **`code_full_scale` per channel, never exceeded** | The +10.8 V range exists to absorb the 100 Ω series drop into the valve's ~6.5 kΩ / ~10 kΩ input, not to over-drive it. Nominal codes are ±~1 %; calibration replaces them. |
 | **Heartbeat, default 2 s, `HBT 0` to disable** | USB CDC gives no reliable "host went away". Arms on the first command after boot so a fresh boot with no host does not fault. The GUI feeds it every 1 s. |
 | **Watchdog 2 s, kicked only from the main loop** after a successful housekeeping pass | A hang gets the pulls' safe state for free. Never kicked from an ISR. |
@@ -167,7 +167,7 @@ From FIRMWARE_HANDOFF §11 plus what the firmware work surfaced:
 | Item | Owner | Impact |
 |---|---|---|
 | **SPI mode to verify** on the bench (`VERIFY`; `SPIMODE 1` if mode 2 fails) | bring-up | Driver default; boot refuses to enable the rail until the readback passes |
-| **Channel map to measure** (FIRMWARE_HANDOFF §9 steps 2 and 4), then `CAL MAP` + `CAL SAVE` | bring-up | Default `BACD/3210` is the Gerber-review prediction, not a measurement |
+| **Channel map to measure** (FIRMWARE_HANDOFF §9 steps 2 and 4), then `CAL MAP` + `CAL SAVE` | bring-up | DAC side verified 2026-09-10 (`CDBA`); ADC side (`3210`) from the netlist, still to confirm with a valve on each pad |
 | **CH4 monitor presence** — ITV0030-3BL may lack the monitor output | hardware / purchasing | `CAL RBEN 4` default; until known, expect `n/a` or an open-load report on CH4 |
 | **WDT vs. bootloader interaction.** The nRF52 WDT keeps running through a soft reset, so the 1200-baud touch into the bootloader relies on the bootloader feeding the WDT during DFU | bring-up | If `pio run -t upload` fails after a WDT-enabled firmware is on the board, use the double-tap UF2 route |
 | Update README §9 / SCHEMATIC_SPEC §10 (hardware repo) to the §5 map | docs | None — firmware uses the measured map |

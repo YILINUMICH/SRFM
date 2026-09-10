@@ -33,6 +33,15 @@ SECTIONS
     KEEP(*(.fs_data))
     PROVIDE(__stop_fs_data = .);
   } > RAM
+
+  /* Survives a watchdog reset (RAM is retained; only .bss is zeroed by the
+   * startup code). Used by the firmware to carry a "go to DFU" request across
+   * the watchdog reset that stops the WDT -- see src/main.cpp. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit*))
+  } > RAM
 } INSERT AFTER .data;
 
 INCLUDE "nrf52_common.ld"

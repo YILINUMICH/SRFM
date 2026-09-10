@@ -31,7 +31,7 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 
 | Command | Reply | Notes |
 |---|---|---|
-| `ID` | `OK SRFM-PCB v2.0 state=<state> map=<d1><d2><d3><d4>/<a1><a2><a3><a4> cal=<ok\|uncal> hb=<s\|off>` | `map` = DAC output letter (A–D) and ADC input number (0–3) per CH1..CH4, e.g. `BACD/3210` |
+| `ID` | `OK SRFM-PCB v2.0 state=<state> map=<d1><d2><d3><d4>/<a1><a2><a3><a4> cal=<ok\|uncal> hb=<s\|off>` | `map` = DAC output letter (A–D) and ADC input number (0–3) per CH1..CH4, e.g. `CDBA/3210` (the netlist-verified map) |
 | `SET <ch> <pct>` | `OK ch<n> pct=<p> code=<c>` | 0.0–100.0 % of the valve's full scale. Out of range → `ERR`, never clamped |
 | `SETALL <p1> <p2> <p3> <p4>` | `OK` | four percentages |
 | `P <ch> <pressure>` | `OK <name> p=<applied> v=<valve volts>` | engineering units (kPa) through the pressure calibration; **clamped** to the calibrated range like the old firmware, reply shows what was applied |
@@ -55,7 +55,7 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `CAL FS <ch> <code>` | `OK` | `code_full_scale`: DAC code that puts 10.000 V at the valve (default 3851 CH1–3, 3831 CH4). ≤ 4095 |
 | `CAL RB <ch> <mV_per_code> <offset_code>` | `OK` | monitor gain (default 3.19) and offset (default 0): `V_mon = (code − off) × mV/1000` |
 | `CAL RBEN <ch> <0\|1>` | `OK` | monitor readback enabled; 0 reports `n/a` (CH4 ITV0030 may have no monitor) |
-| `CAL MAP <ch> <A-D> <0-3>` | `OK` | physical DAC output and ADS1015 input for a logical channel. Rejected if it would duplicate another channel's DAC output |
+| `CAL MAP <ch> <A-D> <0-3>` | `OK` | physical DAC output and ADS1015 input for a logical channel. If another channel already owns that DAC output the two channels swap outputs, so any permutation can be entered line by line |
 | `CAL PRESS <ch> <vMin> <vMax> <pMin> <pMax>` | `OK` | pressure↔valve-voltage endpoints. Legacy form `CAL <ch> <vMin> <vMax> <pMin> <pMax>` also accepted |
 | `CAL SAVE` | `OK saved` | write to flash (`/srfm_cal.bin`, versioned + CRC) |
 | `CAL DEFAULT` | `OK defaults` | nominal values in RAM (not saved until `CAL SAVE`) |
@@ -69,9 +69,11 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `VERIFY` | `OK verify=<yes\|no> pc=0x<readback>` | re-reads the DAC power-control register; `yes` when DB4:0 = 0x1F |
 | `SPIMODE <1\|2>` | `OK spimode=<m> verify=<yes\|no>` | re-init SPI in that mode, re-run the DAC bring-up and the readback proof (step 1). Persist the working mode with `CAL SAVE` |
 | `RAW <A-D> <code>` | `OK dac<X> code=<c> vdac=<volts>` | write a code to a **physical** DAC output, bypassing the channel map (step 2). 0–4095; use with no air connected |
+| `RAWGET <A-D>` | `OK dac<X> code=<c> range=<r> func=0x<f> vdac=<volts>` | read the DAC's own registers for one physical output: held code, range (2 = +10.8 V), control-function bits. Proves a `RAW` write landed |
 | `ADC <0-3>` | `OK ain<n> code=<c> v=<pin volts>` | one raw single-ended conversion on a physical ADS1015 input (steps 3–4) |
 | `RAIL <ON\|OFF>` | `OK rail=<on\|off>` | drive SHDN directly (step 4). `ON` refused while FLT is latched |
 | `DUMP` | `OK ch1=<code>,<dacX>,<ainN>,<adc code>,<mon V> ; …` | raw per-channel view |
+| `DFU` | `OK entering bootloader` | outputs to zero, rail off, then into the serial-DFU bootloader (same path the 1200-baud touch of `pio run -t upload` uses) |
 | `HANG` | `OK hanging` | stalls the main loop to prove the watchdog (step 7): rail drops, DAC clears, board re-enumerates within ~2 s |
 
 ## Events (unsolicited, prefixed `!`)
