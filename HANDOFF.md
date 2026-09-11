@@ -42,6 +42,23 @@ about 3828 for CH3). Outputs A, C and D still clamp at 0.7 V until D10, D7
 and D8 are reworked the same way. A transient 0.02 V reading on U3 pin 4
 during this work was a probing artefact, not a dead output.
 
+### ADC side of the channel map verified (2026-09-10, later)
+
+With CMD3 driven to 3.0 V and a jumper from the CMD3 pad to each RD pad in
+turn, exactly one ADS1015 input rose each time (about 0.977 V at the pin,
+2 % above the 0.955 V expected through the 0.3139 divider): RD1→AIN3,
+RD2→AIN2, RD3→AIN1, RD4→AIN0. Both halves of `CDBA/3210` are now measured.
+The fault logic behaved: the jumpered channel reported `stuck` (monitor 53 %
+against its command) and the others `open` with the rail on and no valve.
+
+Also found during this session: after the D10 rework the DAC went silent
+(readback 0x0000 / floating, REFOUT 0 V, DVCC read 0 V at pin 14 at one
+point); the cause was a loose solder joint on the SCLK line, reflowed.
+While pins were being pressed the eFuse latched once; `RAIL FORCE` now
+cycles SHDN low first, which clears the latch. AVDD is regulated by U2 from
+the switched +24V net (not from 3V3 as FIRMWARE_HANDOFF states), so the DAC
+cannot drive any output while the rail is off.
+
 ## 1. What this project is
 
 A control chain for **3 vacuum regulators + 1 air-pressure regulator** from a PC:

@@ -71,6 +71,7 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `RAW <A-D> <code>` | `OK dac<X> code=<c> vdac=<volts>` | write a code to a **physical** DAC output, bypassing the channel map (step 2). 0–4095; use with no air connected |
 | `RAWGET <A-D>` | `OK dac<X> code=<c> range=<r> func=0x<f> vdac=<volts>` | read the DAC's own registers for one physical output: held code, range (2 = +10.8 V), control-function bits. Proves a `RAW` write landed |
 | `ADC <0-3>` | `OK ain<n> code=<c> v=<pin volts>` | one raw single-ended conversion on a physical ADS1015 input (steps 3–4) |
+| `RAIL FORCE` | `OK rail=forced flt=<0\|1>` | bench only: raise SHDN with no DAC proof and no state change (AVDD is regulated from the switched 24 V, so this is needed to examine the DAC's analog side when it is not answering). Valves must be disconnected |
 | `RAIL <ON\|OFF>` | `OK rail=<on\|off>` | drive SHDN directly (step 4). `ON` refused while FLT is latched |
 | `DUMP` | `OK ch1=<code>,<dacX>,<ainN>,<adc code>,<mon V> ; …` | raw per-channel view |
 | `DFU` | `OK entering bootloader` | outputs to zero, rail off, then into the serial-DFU bootloader. Two resets (~3 s): a request file `/dfu_req` is written to internal flash, the watchdog is allowed to fire (the only reset that stops it), and the next boot consumes the file and soft-resets into DFU. This is what `tools/upload_dfu.py` sends for `pio run -t upload`; a 1200-baud touch from other tools is wrapped onto the same path |

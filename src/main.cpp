@@ -778,7 +778,21 @@ static void handleLine(char *line)
     {
       char *a = strtok(nullptr, " \t");
       if (a) for (char *p = a; *p; p++) *p = (char)toupper((unsigned char)*p);
-      if (a == nullptr || (strcmp(a, "ON") != 0 && strcmp(a, "OFF") != 0)) { printfln("ERR usage: RAIL <ON|OFF>"); return; }
+      if (a && strcmp(a, "FORCE") == 0)
+      {
+        // Bench only: raise SHDN with no DAC proof and no state change, so
+        // the analog supply (AVDD is regulated from the switched 24 V) can
+        // be examined while the DAC is not answering. Valves must be off.
+        // Cycle SHDN low first: that is how a latched TPS26600 is cleared.
+        railSet(false);
+        delay(CLEARFAULT_OFF_MS);
+        railSet(true);
+        delay(RAIL_SETTLE_MS);
+        fltLatched = (digitalRead(PIN_EFUSE_FLT) == LOW);
+        printfln("OK rail=forced flt=%u", fltLatched ? 1 : 0);
+        return;
+      }
+      if (a == nullptr || (strcmp(a, "ON") != 0 && strcmp(a, "OFF") != 0)) { printfln("ERR usage: RAIL <ON|OFF|FORCE>"); return; }
       wantOn = (strcmp(a, "ON") == 0);
     }
     else wantOn = (cmd[2] == 'A');   // STARt vs STOp
@@ -888,6 +902,28 @@ static void handleLine(char *line)
     if (a[0] == 'S') NVIC_SystemReset();
     __disable_irq();
     for (;;) { }
+  }
+  else if (strcmp(cmd, "PINTEST") == 0)
+  {
+    // Bench only: hold one DAC-side MCU pin at a level so it can be checked
+    // with a DMM at U3, or read the MISO input. SCK/MOSI take the SPI
+    // peripheral offline; START (or SPIMODE) brings it back.
+    char *a = strtok(nullptr, " 	");
+    char *b = strtok(nullptr, " 	");
+    if (a) for (char *p = a; *p; p++) *p = (char)toupper((unsigned char)*p);
+    if (a == nullptr) { printfln("ERR usage: PINTEST <SYNC|CLR|SCK|MOSI> <0|1> | PINTEST MISO"); return; }
+    if (strcmp(a, "MISO") == 0) { pinMode(PIN_SPI_MISO, INPUT); printfln("OK miso=%d", digitalRead(PIN_SPI_MISO)); return; }
+    long v;
+    if (!parseLong(b, &v) || (v != 0 && v != 1)) { printfln("ERR usage: PINTEST <SYNC|CLR|SCK|MOSI> <0|1>"); return; }
+    uint8_t pin;
+    if (strcmp(a, "SYNC") == 0) pin = PIN_DAC_SYNC;
+    else if (strcmp(a, "CLR") == 0) pin = PIN_DAC_CLR;
+    else if (strcmp(a, "SCK") == 0) { SPI.end(); pin = PIN_SPI_SCK; }
+    else if (strcmp(a, "MOSI") == 0) { SPI.end(); pin = PIN_SPI_MOSI; }
+    else { printfln("ERR unknown pin %s", a); return; }
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, v ? HIGH : LOW);
+    printfln("OK %s=%ld (D%u)", a, v, pin);
   }
   else if (strcmp(cmd, "HANG") == 0)
   {
