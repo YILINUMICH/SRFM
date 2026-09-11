@@ -59,6 +59,14 @@ cycles SHDN low first, which clears the latch. AVDD is regulated by U2 from
 the switched +24V net (not from 3V3 as FIRMWARE_HANDOFF states), so the DAC
 cannot drive any output while the rail is off.
 
+### All four command paths clean (2026-09-10, late)
+
+D7, D8, D9 and D10 all reworked. Every DAC output (A-D) sweeps 0 to 10.15 V
+with the overcurrent bit never set. Bring-up steps 1-4 are complete on the
+assembled board: SPI proof, DAC channel map (CDBA), I2C proof, ADC channel
+map (3210). Remaining: step 5 loopback with real valves, step 6
+cross-coupling, step 7 watchdog, then `CAL FS` / `CAL RB` per channel.
+
 ## 1. What this project is
 
 A control chain for **3 vacuum regulators + 1 air-pressure regulator** from a PC:
