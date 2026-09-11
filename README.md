@@ -35,7 +35,7 @@ Two documents are authoritative and this README only summarises them:
 | `firmware/variants/Seeed_XIAO_nRF52840/` | Pin-map variant, copied from Seeed's Arduino core |
 | `firmware/linker/nrf52840_s140_v7.ld` | Linker script placing the application at `0x27000` (SoftDevice S140 7.x) |
 | `firmware/tools/upload_dfu.py` | PlatformIO pre-upload hook: finds the board by USB VID, sends `DFU`, waits for the bootloader port (see [Deployment](#deployment)) |
-| `hardware/SRFMV1/` | Board fab files and the netlist `SRFMV1.tel` the channel map was read from |
+| `hardware/SRFM_PCB/` | Board design: V1.1 Gerbers (2026-09-11, D7–D10 orientation fixed), the netlist `Netlist_Schematic1_2026-09-11.tel` and the EasyEDA project. The V1 files the assembled board was built from are in git history (`hardware/SRFMV1/` at commit e6ce3fd) |
 | `firmware/lib/AD5724R/` | AD5724R SPI DAC driver (24-bit frames, SPI mode 2, register readback) |
 | `firmware/lib/ADS1015/` | ADS1015 I²C ADC driver (single-shot, averaging) |
 | `firmware/lib/ValveConfig/` | Persisted calibration/config struct (channel map, full-scale codes, readback gain/enable, pressure endpoints, heartbeat timeout) — version + CRC in LittleFS `/srfm_cal.bin` |
@@ -97,8 +97,8 @@ silkscreen.
 | 3 | SMC ITV2090-312L5 (vacuum) | `VAC3` | −1.3 … −80 kPa | VOUT **B** (R20) | AIN **1** |
 | 4 | SMC ITV0030-3BL (air pressure) | `AIR` | +1 … +500 kPa | VOUT **A** (R21) | AIN **0** |
 
-> **The physical map above is verified.** It comes from the SRFMV1 netlist
-> (`hardware/SRFMV1/SRFMV1.tel`: VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3,
+> **The physical map above is verified.** It comes from the board netlist
+> (`hardware/SRFM_PCB/Netlist_Schematic1_2026-09-11.tel`, unchanged from V1: VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3,
 > VOUTA→R21→CMD4; AIN3…AIN0 ← RD1…RD4) and was confirmed on the bench on
 > 2026-09-10 (VOUTB measured on the CH3 pads). It is the firmware default
 > (`map=CDBA/3210`). The Gerber-review prediction in FIRMWARE_HANDOFF §5

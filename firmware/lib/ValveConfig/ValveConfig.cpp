@@ -20,7 +20,7 @@ void ValveConfigStore::setDefaults()
 {
   memset(&_cfg, 0, sizeof(_cfg));
 
-  // Physical map from the SRFMV1 netlist (SRFMV1/SRFMV1.tel), confirmed on
+  // Physical map from the board netlist (hardware/SRFM_PCB/*.tel, same in V1 and V1.1), confirmed on
   // the bench 2026-09-10 (VOUTB measured on the CH3 pads):
   //   CH1 -> VOUT C (R18) / AIN3,  CH2 -> VOUT D (R19) / AIN2,
   //   CH3 -> VOUT B (R20) / AIN1,  CH4 -> VOUT A (R21) / AIN0.
