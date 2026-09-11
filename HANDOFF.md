@@ -64,8 +64,10 @@ cannot drive any output while the rail is off.
 D7, D8, D9 and D10 all reworked. Every DAC output (A-D) sweeps 0 to 10.15 V
 with the overcurrent bit never set. Bring-up steps 1-4 are complete on the
 assembled board: SPI proof, DAC channel map (CDBA), I2C proof, ADC channel
-map (3210). Remaining: step 5 loopback with real valves, step 6
-cross-coupling, step 7 watchdog, then `CAL FS` / `CAL RB` per channel.
+map (3210). Step 7 (watchdog) passed: after `HANG` the USB port dropped at 1.15 s and
+the board was back, re-enumerated and READY with the rail up, at 1.98 s.
+Remaining: step 5 loopback with real valves, step 6 cross-coupling, then
+`CAL FS` / `CAL RB` per channel.
 
 ## 1. What this project is
 
