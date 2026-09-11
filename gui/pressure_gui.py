@@ -95,8 +95,12 @@ def fmt_hms(seconds):
 def parse_get_reply(body):
     """Split a GET reply body into {firmware name: (pressure, volts, monitor)}.
 
-    "VAC1=-40.00,5.000V,49.1%; VAC2=-1.30,0.000V,1.6%; ...; AIR=250.50,5.000V,n/a"
-    -> {"VAC1": ("-40.00", "5.000", "49.1%"), ...}
+    "VAC1=-40.00,5.000V,49.1%,2.964V; ...; AIR=250.50,5.000V,n/a,n/a"
+    -> {"VAC1": ("-40.00", "5.000", ("49.1%", "2.964")), ...}
+
+    The monitor is a (percent, monitor-pin volts) pair as reported by the
+    firmware; either half may be "n/a". Older firmware without the volts
+    field yields ("49.1%", None).
 
     Channels are matched by the name before '=', not by position. Parts that
     do not carry a known name are skipped, so any other reply that happens to
@@ -112,27 +116,45 @@ def parse_get_reply(body):
         if len(fields) < 2:
             continue
         volts = fields[1].rstrip("Vv")
-        monitor = fields[2] if len(fields) > 2 and fields[2] else "n/a"
-        found[name] = (fields[0], volts, monitor)
+        mon_pct = fields[2] if len(fields) > 2 and fields[2] else "n/a"
+        mon_v = fields[3].rstrip("Vv") if len(fields) > 3 and fields[3] else None
+        found[name] = (fields[0], volts, (mon_pct, mon_v))
     return found
 
 
 def monitor_text(monitor, p_at_0v, p_at_10v, unit):
     """Monitor field of a GET reply as display text.
 
-    The firmware reports the valve's analog monitor as a percentage of full
-    scale — the same 0-100 % the 0-10 V command spans — so the equivalent
-    pressure comes from the panel's own endpoints:
-    "49.1%" -> "49.1 % ≈ -40.0 kPa". Anything else ("n/a") is shown as-is.
+    `monitor` is either the (percent, volts) pair from parse_get_reply or a
+    bare percent string. The valve's monitor pin spans 1 V (0 %) to 5 V
+    (100 %) over the same range the 0-10 V command covers, so the pressure
+    is derived from the measured monitor voltage with the panel's own
+    endpoints:
+        ("53.0%", "3.118") -> "3.118 V  (53.0 %)  ≈ -43.0 kPa"
+    "n/a" (no monitor on this valve, or readback disabled) is shown as-is.
     """
-    text = monitor.strip()
-    if not text:
+    if isinstance(monitor, tuple):
+        pct_text, volts_text = monitor
+    else:
+        pct_text, volts_text = monitor, None
+    pct_text = (pct_text or "").strip()
+    if not pct_text:
         return "n/a"
-    if not text.endswith("%"):
-        return text
-    pct = to_float(text[:-1])
+    if not pct_text.endswith("%"):
+        return pct_text
+    pct = to_float(pct_text[:-1])
     if pct is None:
-        return text
+        return pct_text
+    volts = to_float(volts_text) if volts_text else None
+    if volts is not None:
+        if volts < 0.5:
+            # The monitor never sits below 1 V on a live valve (0.76 V at
+            # -6 %); this low means no valve, no 24 V or an open line.
+            return f"{volts:.3f} V  (no monitor signal)"
+        # Pressure from the voltage actually measured, not from the rounded %.
+        frac = (volts - 1.0) / 4.0
+        pressure = p_at_0v + (p_at_10v - p_at_0v) * frac
+        return f"{volts:.3f} V  ({pct:.1f} %)  ≈ {pressure:.1f} {unit}"
     pressure = p_at_0v + (p_at_10v - p_at_0v) * pct / 100.0
     return f"{pct:.1f} % ≈ {pressure:.1f} {unit}"
 

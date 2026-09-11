@@ -37,8 +37,8 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `P <ch> <pressure>` | `OK <name> p=<applied> v=<valve volts>` | engineering units (kPa) through the pressure calibration; **clamped** to the calibrated range like the old firmware, reply shows what was applied |
 | `V <ch> <volts>` | `OK ch<n> v=<volts> code=<c>` | voltage **at the valve**, 0–10 V, out of range → `ERR` |
 | `C <ch> <code>` | `OK ch<n> code=<c> v=<volts>` | raw 12-bit DAC code, 0..`code_full_scale[ch]`, out of range → `ERR` |
-| `GET` | `OK VAC1=<p>,<v>V,<mon>; VAC2=…; VAC3=…; AIR=…` | per channel: commanded pressure, commanded valve voltage, monitor as `<pct>%` of F.S. or `n/a` |
-| `GET <ch>` | `OK ch<n> cmd=<pct> mon=<pct\|n/a> status=<status>` | status: `ok`, `open`, `high`, `stuck`, `oc`, `n/a`, `norail` |
+| `GET` | `OK VAC1=<p>,<v>V,<mon>,<monV>V; VAC2=…; VAC3=…; AIR=…` | per channel: commanded pressure, commanded valve voltage, monitor as `<pct>%` of F.S. and as the monitor-pin voltage (1 V = 0 %, 5 V = 100 %); `n/a,n/a` when readback is disabled |
+| `GET <ch>` | `OK ch<n> cmd=<pct> mon=<pct\|n/a> monv=<volts\|n/a> status=<status>` | status: `ok`, `open`, `high`, `stuck`, `oc`, `n/a`, `norail` |
 | `STATUS` | `OK state=<state> rail=<on\|off> flt=<0\|1> dac=0x<pc> cal=<ok\|uncal> hb=<s\|off> ch1=<cmd>,<mon>,<status> … ch4=…` | one line; `dac` is the raw power-control readback (0x001F = healthy) |
 | `ZERO` | `OK all zero` | every channel to 0 %, rail stays on (GUI panic button) |
 | `STOP` | `OK stopped` | all channels 0 **then** rail off (handoff §6 order). Needs `START` to resume |

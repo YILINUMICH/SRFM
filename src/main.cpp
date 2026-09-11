@@ -479,9 +479,11 @@ static void replyHb(char *out, size_t n)
 
 static void monField(uint8_t i, char *out, size_t n)
 {
+  // "<pct>%,<volts>V" or "n/a,n/a": monitor as fraction of full scale and as
+  // the valve's monitor-pin voltage (1 V = 0 %, 5 V = 100 %).
   const Channel &c = chan[i];
-  if (!c.monValid) snprintf(out, n, "n/a");
-  else snprintf(out, n, "%.1f%%", c.monFrac * 100.0f);
+  if (!c.monValid) snprintf(out, n, "n/a,n/a");
+  else snprintf(out, n, "%.1f%%,%.3fV", c.monFrac * 100.0f, c.monVolts);
 }
 
 static void monPct(uint8_t i, char *out, size_t n)
@@ -502,7 +504,7 @@ static void cmdId()
 
 static void cmdGetAll()
 {
-  char m[4][12];
+  char m[4][20];
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++) monField(i, m[i], sizeof(m[i]));
   size_t pos = 0;
   pos += snprintf(reply + pos, sizeof(reply) - pos, "OK ");
@@ -522,7 +524,10 @@ static void cmdGetOne(uint8_t i)
 {
   char m[12];
   monPct(i, m, sizeof(m));
-  printfln("OK ch%u cmd=%.1f mon=%s status=%s", i + 1, chan[i].cmdFrac * 100.0f, m, chStatusName(chan[i].status));
+  if (chan[i].monValid)
+    printfln("OK ch%u cmd=%.1f mon=%s monv=%.3f status=%s", i + 1, chan[i].cmdFrac * 100.0f, m, chan[i].monVolts, chStatusName(chan[i].status));
+  else
+    printfln("OK ch%u cmd=%.1f mon=n/a monv=n/a status=%s", i + 1, chan[i].cmdFrac * 100.0f, chStatusName(chan[i].status));
 }
 
 static void cmdStatus()
