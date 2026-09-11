@@ -34,6 +34,8 @@ Two documents are authoritative and this README only summarises them:
 | `boards/xiao_nrf52840.json` | Board definition — PlatformIO has no stock XIAO nRF52840 |
 | `variants/Seeed_XIAO_nRF52840/` | Pin-map variant, copied from Seeed's Arduino core |
 | `linker/nrf52840_s140_v7.ld` | Linker script placing the application at `0x27000` (SoftDevice S140 7.x) |
+| `tools/upload_dfu.py` | PlatformIO pre-upload hook: finds the board by USB VID, sends `DFU`, waits for the bootloader port (see [Deployment](#deployment)) |
+| `SRFMV1/` | Board fab files and the netlist `SRFMV1.tel` the channel map was read from |
 | `lib/AD5724R/` | AD5724R SPI DAC driver (24-bit frames, SPI mode 2, register readback) |
 | `lib/ADS1015/` | ADS1015 I²C ADC driver (single-shot, averaging) |
 | `lib/ValveConfig/` | Persisted calibration/config struct (channel map, full-scale codes, readback gain/enable, pressure endpoints, heartbeat timeout) — version + CRC in LittleFS `/srfm_cal.bin` |
@@ -49,7 +51,10 @@ Two documents are authoritative and this README only summarises them:
 
 Everything on one board. The XIAO is soldered down and **SWD is not
 accessible** — the stock UF2/DFU bootloader is the only way in, so never
-ship firmware that disables USB.
+ship firmware that disables USB. The module on the assembled SRFMV1 board is
+the XIAO nRF52840 **Sense** variant (USB VID 0x2886; PID 0x8045 with the
+stock firmware, 0x8044 with ours, 0x0045 in the bootloader); its IMU is not
+on D4/D5, so there is no I²C conflict.
 
 ### Pin map (as built — FIRMWARE_HANDOFF §1)
 
@@ -115,13 +120,32 @@ pio run -t upload                   # flash via the stock bootloader (serial DFU
 ```
 
 The upload uses `adafruit-nrfutil` serial DFU through the XIAO's stock
-bootloader, with a 1200-baud touch to enter it; PlatformIO fetches the tool
-itself. If it picks the wrong port, name it (`COM3` on Windows,
-`/dev/cu.usbmodem*` on macOS, `/dev/ttyACM*` on Linux):
+bootloader; PlatformIO fetches the tool itself. PlatformIO's own 1200-baud
+touch is **not** used (`board_upload.use_1200bps_touch = no`). Instead the
+pre-upload hook `tools/upload_dfu.py` finds the board by USB VID 0x2886: if a
+bootloader port (PID 0x0044/0x0045) is already there it uses it; otherwise it
+opens the application port (PID 0x8044/0x8045), sends the `DFU` command,
+waits up to 15 s for the bootloader port to appear and hands that port to
+`adafruit-nrfutil`. `--upload-port` is optional and only forces which
+application port gets the `DFU`:
 
 ```sh
 pio run -t upload --upload-port COM3
 ```
+
+Why the detour: the nRF52 watchdog keeps running across a soft reset and the
+XIAO's stock bootloader (Adafruit-derived UF2 bootloader 0.6.1, S140 7.3.0)
+does not feed it, so the standard touch → soft reset → DFU gets cut off ~2 s
+in and leaves the bootloader in DFU mode with an invalid app (a second upload
+then works, but that is the recovery, not the flow). The firmware's `DFU`
+entry is therefore a double hop: outputs and rail to the safe state, write a
+request file `/dfu_req` in internal LittleFS, stop kicking the watchdog →
+watchdog reset (the only reset that stops the WDT) → the freshly booted
+firmware sees the file before starting the watchdog, deletes it and performs
+the core's normal soft reset into serial DFU. The core's `enterSerialDfu()`
+is redirected to this path with `-Wl,--wrap=enterSerialDfu`, so a 1200-baud
+touch from other tools (Arduino IDE) also works, just slower (~3 s). Verified
+on the bench 2026-09-10; see [`HANDOFF.md`](HANDOFF.md) § Bench status.
 
 The toolchain is not stock: the repo carries the board JSON, the pin variant
 and a linker script because PlatformIO does not know the XIAO nRF52840 and
@@ -132,11 +156,13 @@ SoC calls this firmware makes; the linker script puts the application at
 § Toolchain.
 
 **Fallback — UF2 via the bootloader.** If serial DFU fails or the firmware
-hangs so the 1200-baud touch cannot reach it (a watchdog-enabled build that
-is stuck, for instance), **double-tap the XIAO's reset button**. A USB drive
-named `XIAO-SENSE` appears. Convert the build to UF2 with `uf2conv.py` from
-[Microsoft's uf2 repo](https://github.com/microsoft/uf2) and copy it onto the
-drive:
+hangs so the `DFU` request cannot reach it (a build that is stuck before it
+services the serial port, for instance), **double-tap the XIAO's reset
+button**. A USB drive named `XIAO-SENSE` appears and the bootloader port
+enumerates, so `pio run -t upload` works again as-is (the hook sees the
+bootloader port and skips the `DFU` step). Alternatively convert the build to
+UF2 with `uf2conv.py` from [Microsoft's uf2
+repo](https://github.com/microsoft/uf2) and copy it onto the drive:
 
 ```sh
 python uf2conv.py -f 0xADA52840 -b 0x27000 -c -o firmware.uf2 .pio/build/xiao_nrf52840/firmware.hex
@@ -156,15 +182,23 @@ pio device monitor                  # 115200 (CDC ignores the baud)
 
 The boot-time `!READY` / `!FAULT` line is printed before USB is up, so you
 will not see it; `STATUS` shows the same information (`state=READY`,
-`dac=0x001F`), and `START` prints a fresh `!READY ch1=… ch4=…`. Type `ID` → `OK SRFM-PCB v2.0 state=READY map=CDBA/3210
-cal=… hb=2`. Type `VERIFY` → `OK verify=yes pc=0x001F` proves the SPI link to
+`dac=0x001F`), and `START` prints a fresh `!READY ch1=… ch4=…`. Type `ID` →
+`OK SRFM-PCB v2.0 state=READY map=CDBA/3210 cal=ok hb=2 rst=0x0
+bootword=0xFFFFFFFF` (the trailing `rst=`/`bootword=` are boot diagnostics:
+`RESETREAS` and the raw `.noinit` request word as seen at boot — the
+bootloader clears `RESETREAS` before starting the app, so `rst=0x0` is
+normal). Type `VERIFY` → `OK verify=yes pc=0x001F` proves the SPI link to
 the DAC. Ctrl-C to quit, and make sure the monitor *is* closed before starting
 the GUI: only one program can hold the port.
 
 > Typing by hand? The link-loss heartbeat defaults to **2 s** and arms on the
 > first command, so a slow second command trips `!FAULT LINKLOST`. Send
 > `HBT 0` first when driving the board from a terminal (`START` recovers from
-> LINKLOST).
+> LINKLOST). `CAL DEFAULT` + `CAL SAVE` puts the saved timeout back to 2 s.
+>
+> With the 24 V supply absent the board boots into `!FAULT FLT`: the eFuse
+> is unpowered and its FLT pin reads low. That is expected; `CLEARFAULT` (or
+> `START`) recovers once 24 V is present.
 
 **4. Run the GUI:**
 
@@ -226,6 +260,11 @@ FIRMWARE_HANDOFF §9, with the exact commands. **No air connected. MainPower
 switch OFF until step 4.** Open `pio device monitor` and send `HBT 0` first
 so the heartbeat does not interrupt you.
 
+> **Where it stands (2026-09-10):** steps 1–3 pass. Step 2 is blocked by a
+> board fault — every DAC output hits its 20 mA clamp at ~0.67 V because the
+> TVS diodes D7–D10 on VOUTA–D are fitted forward-biased to ground. Fix them
+> before continuing (details in [`HANDOFF.md`](HANDOFF.md) § Bench status).
+
 **1. SPI proof.** `STATUS` should show `state=READY` (or `state=FAULT
 reason=SPI` when the DAC readback failed, in which case the rail stays off).
 Then:
@@ -237,6 +276,8 @@ VERIFY                 → OK verify=yes pc=0x001F
 If `verify=no`: check CLR is actually high on D3 (low = every write is
 ignored), then `SPIMODE 1` and `VERIFY` again, then scope SYNC/SCK/MOSI.
 `CAL SAVE` persists the mode that works, so the next boot starts in it.
+*Bench 2026-09-10: PASS in mode 2; `RAWGET` readbacks return what was
+written.*
 
 **2. DAC channel map.** With SHDN still low (AVDD is up regardless), write a
 half-scale code to one *physical* output at a time and DMM every valve pad
@@ -244,12 +285,18 @@ field's pin 2 (white):
 
 ```
 RAW A 2048             → OK dacA code=2048 vdac=5.400
+RAWGET A               → OK dacA code=2048 range=2 func=0xC vdac=5.400
 ```
 
-Whichever pad reads ~5.3 V is wired to VOUTA — expect the CH2 pads. Repeat
-`RAW B 2048`, `RAW C 2048`, `RAW D 2048` (writing `RAW X 0` in between) and
-note the pad for each letter. A result different from the [channel
-table](#channels) is not a firmware problem — record what you measured.
+`RAWGET` reads the DAC's own registers back, so it separates "the write did
+not land" from "the output stage is not delivering". Whichever pad reads
+~5.3 V is wired to VOUTA — per the netlist that is the **CH4** pads
+(VOUTA→R21→CMD4). Repeat `RAW B 2048`, `RAW C 2048`, `RAW D 2048` (writing
+`RAW X 0` in between) and note the pad for each letter. A result different
+from the [channel table](#channels) is not a firmware problem — record what
+you measured. *Bench 2026-09-10: VOUTB seen on the CH3 pads, confirming the
+netlist; but the pads only track the DAC below ~0.67 V and `!FAULT OC n`
+fires above — see the D7–D10 note above.*
 
 **3. I²C proof.** The ADS1015 must ACK at 0x48 and read near zero with
 nothing driving its inputs:
@@ -257,6 +304,9 @@ nothing driving its inputs:
 ```
 ADC 0                  → OK ain0 code=<small> v=<~0>
 ```
+
+*Bench 2026-09-10: PASS; ACK at 0x48, inputs read ~0.02 V with nothing
+connected.*
 
 **4. Rail and readback map.** MainPower ON, then:
 
@@ -275,14 +325,18 @@ ADC 3
 ```
 
 The input that rises to ~1 V (code ≈ 314, 0 % F.S.) is wired to CH1 — expect
-AIN3. Repeat for the CH2, CH3 and CH4 pad fields. Now enter the measured map
-(DAC letter from step 2, ADC input from this step) and save it:
+AIN3 (netlist: AIN3/2/1/0 ← RD1/2/3/4; not yet confirmed with a valve). Repeat
+for the CH2, CH3 and CH4 pad fields. If the measured map differs from the
+default `CDBA/3210`, enter it (DAC letter from step 2, ADC input from this
+step) and save it — `CAL MAP` swaps DAC outputs between channels when the
+requested output is already held by another channel, so any permutation can
+be entered line by line:
 
 ```
-CAL MAP 1 B 3
-CAL MAP 2 A 2
-CAL MAP 3 C 1
-CAL MAP 4 D 0
+CAL MAP 1 C 3
+CAL MAP 2 D 2
+CAL MAP 3 B 1
+CAL MAP 4 A 0
 CAL RBEN 4 0           ← only if the CH4 ITV0030 has no monitor and stays near 0
 CAL SAVE               → OK saved
 ID                     → … map=CDBA/3210 cal=ok …
@@ -334,7 +388,7 @@ Operating:
 
 | Command | Meaning |
 |---|---|
-| `ID` | `OK SRFM-PCB v2.0 state=… map=… cal=… hb=…` |
+| `ID` | `OK SRFM-PCB v2.0 state=… map=… cal=… hb=… rst=0x… bootword=0x…` |
 | `SET <ch> <pct>` / `SETALL <p1> <p2> <p3> <p4>` | percent of full scale, 0–100, out of range → `ERR` |
 | `P <ch> <kPa>` | pressure in engineering units through the calibration (clamped, reply shows what was applied) |
 | `V <ch> <volts>` / `C <ch> <code>` | voltage at the valve (0–10) / raw DAC code (0–`code_full_scale`) |
@@ -346,8 +400,10 @@ Operating:
 | `HB` / `HBT <s>` | heartbeat / link-loss timeout (0 = off) |
 | `CAL …` | calibration, below |
 
-Bench: `VERIFY`, `SPIMODE`, `RAW`, `ADC`, `RAIL`, `DUMP`, `HANG` — see
-[Bench bring-up](#bench-bring-up).
+Bench: `VERIFY`, `SPIMODE`, `RAW`, `RAWGET`, `ADC`, `RAIL`, `DUMP`, `HANG` —
+see [Bench bring-up](#bench-bring-up). `DFU` (safe state, then into the
+bootloader — what `pio run -t upload` sends) and `RAMTEST <SOFT|WDT>`
+(reset diagnostic) are in `PROTOCOL.md` too.
 
 Events: `!READY …`, `!FAULT FLT`, `!FAULT LINKLOST`, `!FAULT OPENLOAD <ch>`,
 `!FAULT NORAIL`, `!FAULT STUCK <ch>`, `!FAULT OC <ch>`, `!FAULT TSD`.
@@ -436,5 +492,5 @@ reference.**
 | Host link loss | ignored | heartbeat timeout → stop sequence |
 | Calibration | compile-time defaults, `CAL` lost on reset | persisted in flash with version + CRC; `uncal` flag |
 | Protocol | `OK SRFM-DAC v1.0`, `SPAN`, `DUMP` for 16 channels | `OK SRFM-PCB v2.0`, `SET`/`SETALL`/`STATUS`/`STOP`/`START`/`HB`, bench commands, `!` events |
-| Flashing | avrdude | serial DFU via bootloader, UF2 fallback; no SWD |
+| Flashing | avrdude | serial DFU via bootloader (`DFU` command + watchdog double hop, `tools/upload_dfu.py`), UF2 fallback; no SWD |
 | Board state | always live | `READY` / `STOPPED` / `FAULT` gate every output command |

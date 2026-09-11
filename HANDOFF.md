@@ -2,8 +2,9 @@
 
 **Date:** 2026-09-10
 **Branch:** `custom-pcb-nrf52840` (the Mega 2560 + LTC2668 EVM version stays on `main`)
-**Status:** Firmware compiles clean. **Not yet tested on hardware — bench bring-up pending**
-(README § Bench bring-up / FIRMWARE_HANDOFF §9).
+**Status:** Firmware runs on the assembled SRFMV1 board. Upload flow, SPI and I²C proven;
+**bring-up stalled at step 2 by a board fault (TVS diodes D7–D10 on the DAC outputs)** — see
+§0 below, then README § Bench bring-up / FIRMWARE_HANDOFF §9.
 
 Companion documents, both authoritative over this one where they overlap:
 
@@ -12,6 +13,23 @@ Companion documents, both authoritative over this one where they overlap:
   that override the older design docs (stale pin table, unmeasured channel map, CH4 monitor
   possibly absent).
 - `PROTOCOL.md` — the host command set, replies and events.
+
+## 0. Bench status 2026-09-10
+
+Assembled SRFMV1 board, XIAO nRF52840 **Sense** (USB VID 0x2886; PID 0x8045 stock firmware,
+0x8044 with ours, 0x0045 in the bootloader). No air, no valves connected.
+
+| Item | Result |
+|---|---|
+| **Upload flow** (`pio run -t upload`) | **Works.** `tools/upload_dfu.py` sends `DFU`, the firmware takes the watchdog double hop (~3 s), `adafruit-nrfutil` flashes through the bootloader port. See §5 for the mechanism and why the stock 1200-baud touch is not used. Fallback double-tap reset → `XIAO-SENSE` → `pio run -t upload` also works |
+| Measured, upload-related | The bootloader clears `NRF_POWER->RESETREAS` before starting the app (`ID` shows `rst=0x0`). A `.noinit` RAM word does **not** survive watchdog reset + bootloader pass (`RAMTEST WDT` → `bootword=0xFFFFFFFF`), so the DFU request has to live in flash (`/dfu_req`) |
+| Step 1 — SPI proof | **PASS** in SPI mode 2: `VERIFY` → `pc=0x001F`; `RAWGET` register readbacks return what was written |
+| Step 3 — I²C proof | **PASS**: ADS1015 ACKs at 0x48, inputs read ~0.02 V with nothing connected |
+| Channel map | From the SRFMV1 netlist (`SRFMV1/SRFMV1.tel`, now in the repo): VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3, VOUTA→R21→CMD4; AIN3/2/1/0 ← RD1/2/3/4. DAC side confirmed with a DMM (VOUTB seen on the CH3 pads). Firmware default and the saved config are now **`CDBA/3210`**. FIRMWARE_HANDOFF §5's `BACD` guess was wrong on the DAC side. ADC side still to be confirmed with a valve on each pad (step 4) |
+| **Hardware fault — DAC outputs clamped** | Every DAC output hits its 20 mA current clamp at ~0.67 V with nothing connected (`!FAULT OC n`, power-control readback OC bit set). The netlist shows TVS diodes **D7–D10** (SMA footprint, same as D2 on the 24 V rail) with pin 1 on GND and pin 2 on VOUTA–D, i.e. **forward-biased from the DAC output to ground**; D2 has pin 1 on +24V (the correct TVS orientation). Measurements on U3: pin 24 AVDD 14.69 V, pin 1 AVSS 0 V, pin 14 DVCC 3.3 V, pin 17 REFOUT 2.5 V, pin 4 VOUTB 0.7 V when commanded 5.08 V; the pad tracks the DAC exactly below the clamp (0.527 V commanded → 0.532 V measured). **Fix pending:** rotate D7–D10 180° (only if their standoff is ≥ 11 V), or replace with a 12–15 V unidirectional SMA TVS in the correct orientation, or remove them for bring-up. Part number of D7–D10 unknown (EasyEDA cloud library only) |
+| `!FAULT FLT` at boot with 24 V absent | Expected: FLT reads low while the eFuse is unpowered. `CLEARFAULT` / `START` recovers once 24 V is present |
+| XIAO variant | **Sense** (PID 0x8045 stock). Closes the plain-vs-Sense open item; the IMU is not on D4/D5, no I²C conflict |
+| Bench tip | Send `HBT 0` first when driving the board from a terminal; `CAL DEFAULT` + `CAL SAVE` resets the saved heartbeat to 2 s |
 
 ## 1. What this project is
 
@@ -31,8 +49,10 @@ thing in a hardware-guaranteed safe state whenever it is not deliberately runnin
 
 | Path | Purpose |
 |---|---|
-| `platformio.ini` | env `xiao_nrf52840`: `nordicnrf52@~10.9.0`, Arduino framework (Adafruit nRF52 core, `framework-arduinoadafruitnrf52` 1.6.1), `upload_protocol = nrfutil`, monitor 115200 |
+| `platformio.ini` | env `xiao_nrf52840`: `nordicnrf52@~10.9.0`, Arduino framework (Adafruit nRF52 core, `framework-arduinoadafruitnrf52` 1.6.1), `upload_protocol = nrfutil`, monitor 115200; `build_flags = -Wl,--wrap=enterSerialDfu`, `extra_scripts = tools/upload_dfu.py`, `board_upload.use_1200bps_touch = no`, `board_upload.wait_for_upload_port = no` (see §5) |
+| `tools/upload_dfu.py` | pre-upload hook: finds the board by USB VID 0x2886, uses a bootloader port if present, otherwise sends `DFU` to the application port and waits ≤ 15 s for the bootloader port |
 | `boards/xiao_nrf52840.json` | board definition (see §5) |
+| `SRFMV1/` | board fab outputs and the netlist `SRFMV1.tel` (source of the channel map and the D7–D10 finding) |
 | `variants/Seeed_XIAO_nRF52840/variant.{h,cpp}` | pin map, copied from Seeed's Arduino core |
 | `linker/nrf52840_s140_v7.ld` | application at `0x27000`, RAM from `0x20006000` (see §5) |
 | `lib/AD5724R/` | DAC driver |
@@ -108,8 +128,15 @@ resistor: `code = clamp(round(fraction × code_full_scale), 0, code_full_scale)`
 - **Shutdown** (`STOP`, LINKLOST, FLT): code 0 on all channels **then** SHDN low.
 - **Protocol**: line-oriented ASCII, exactly one reply per command (`OK`/`ERR`/`FAULT`),
   `!` events for asynchronous faults. Full table in `PROTOCOL.md`; bench commands
-  (`VERIFY`, `SPIMODE`, `RAW`, `ADC`, `RAIL`, `DUMP`, `HANG`) exist so FIRMWARE_HANDOFF §9
-  can be walked from a terminal.
+  (`VERIFY`, `SPIMODE`, `RAW`, `RAWGET`, `ADC`, `RAIL`, `DUMP`, `HANG`) exist so
+  FIRMWARE_HANDOFF §9 can be walked from a terminal, plus `DFU` (bootloader entry, used by
+  the upload hook) and `RAMTEST <SOFT|WDT>` (reset diagnostic). `ID` ends with
+  `rst=0x<RESETREAS> bootword=0x<.noinit word>` as seen at boot.
+- **Bootloader entry** (`__wrap_enterSerialDfu` / `honourDfuRequest` in `main.cpp`): safe
+  state, request file `/dfu_req` in LittleFS (plus a `.noinit` word), stop kicking the WDT →
+  watchdog reset → next boot consumes the file before starting the WDT and calls the core's
+  real `enterSerialDfu()`. The `.noinit` word is kept as a diagnostic only; it does not
+  survive the bootloader pass (§0).
 
 ### GUI (`gui/pressure_gui.py`)
 
@@ -131,6 +158,7 @@ The `REGULATORS` table must still be kept in sync with `CAL PRESS` by hand.
 | **`code_full_scale` per channel, never exceeded** | The +10.8 V range exists to absorb the 100 Ω series drop into the valve's ~6.5 kΩ / ~10 kΩ input, not to over-drive it. Nominal codes are ±~1 %; calibration replaces them. |
 | **Heartbeat, default 2 s, `HBT 0` to disable** | USB CDC gives no reliable "host went away". Arms on the first command after boot so a fresh boot with no host does not fault. The GUI feeds it every 1 s. |
 | **Watchdog 2 s, kicked only from the main loop** after a successful housekeeping pass | A hang gets the pulls' safe state for free. Never kicked from an ISR. |
+| **DFU entry is a watchdog double hop with a flash-backed request**, and the upload hook sends `DFU` instead of the 1200-baud touch | The nRF52 WDT survives a soft reset, the stock bootloader does not feed it, and a WDT reset wipes GPREGRET; `.noinit` RAM measured not to survive the bootloader pass either. A file in LittleFS is the one thing that does. The core's `enterSerialDfu()` is `--wrap`ped onto the same path so Arduino-IDE-style touches still work. |
 | **Calibration in LittleFS with version + CRC, `uncal` flag when absent** | Runtime `CAL` on `main` was lost at reset. The host must be able to tell nominal from measured. |
 | **Per-channel monitor thresholds** (FIRMWARE_HANDOFF §7): `< 0.5 V` (code < ~157) = open load; `> 5.6 V` (code > ~1750) = wiring fault; `\|measured − expected\| > 10 % F.S. for > 1 s` = stuck; all four `< ~0.3 V` (code < ~100) with SHDN high = no rail | Nominal 0 % is 1.0 V and −6 % is 0.76 V, so 0.5 V is unambiguous. 10 % leaves room for ±6 % monitor + ±1 % valve + settling. Per-channel faults are reported, not acted on; the monitor is never used as feedback. |
 | **eFuse latch cleared only by `CLEARFAULT`** | The TPS26600 is in latch-off mode deliberately; automatic retry into a short is not wanted. |
@@ -146,7 +174,7 @@ headers and a v6 linker script, while the XIAO's stock bootloader flashes **S140
 
 | File | What it does |
 |---|---|
-| `boards/xiao_nrf52840.json` | `core: nRF5`, `bsp: adafruit`, `variant: Seeed_XIAO_nRF52840` with `variants_dir: variants`, `softdevice: s140 6.1.1, sd_fwid 0x0123`, `ldscript: linker/nrf52840_s140_v7.ld`, `bootloader.settings_addr 0xFF000`, USB VID/PID `0x2886:0x8044` / `0x0044`, `upload: nrfutil`, 1200-bps touch, `maximum_size 811008`, `maximum_ram_size 237568` |
+| `boards/xiao_nrf52840.json` | `core: nRF5`, `bsp: adafruit`, `variant: Seeed_XIAO_nRF52840` with `variants_dir: variants`, `softdevice: s140 6.1.1, sd_fwid 0x0123`, `ldscript: linker/nrf52840_s140_v7.ld`, `bootloader.settings_addr 0xFF000`, USB VID/PID `0x2886:0x8044` / `0x0044`, `upload: nrfutil`, 1200-bps touch (overridden to off in `platformio.ini`), `maximum_size 811008`, `maximum_ram_size 237568` |
 | `variants/Seeed_XIAO_nRF52840/` | Seeed's `variant.h`/`variant.cpp`: `SPI` on D8/D9/D10, `Wire` on D4/D5, `USE_LFXO` |
 | `linker/nrf52840_s140_v7.ld` | `FLASH ORIGIN = 0x27000, LENGTH = 0xED000 − 0x27000`; `RAM ORIGIN = 0x20006000`; `.svc_data`/`.fs_data` sections; `INCLUDE "nrf52_common.ld"` from the core |
 
@@ -154,9 +182,29 @@ The 6.1.1 headers are API-compatible for the SoC calls this firmware makes (no B
 SoftDevice is present only because the bootloader expects it). `sd_fwid 0x0123` is what
 `adafruit-nrfutil` checks at upload. Upload is serial DFU through the stock bootloader
 (`pio run -t upload`, tool fetched by PlatformIO); the fallback is double-tap reset →
-`XIAO-SENSE` drive → copy a UF2 built with
+`XIAO-SENSE` drive / bootloader port → `pio run -t upload` again, or copy a UF2 built with
 `uf2conv.py -f 0xADA52840 -b 0x27000 -c -o firmware.uf2 .pio/build/xiao_nrf52840/firmware.hex`.
 SWD is not accessible on the assembled board, so the bootloader is the only recovery path.
+
+**Getting into the bootloader (verified 2026-09-10).** PlatformIO's 1200-baud touch is
+disabled (`board_upload.use_1200bps_touch = no`, `wait_for_upload_port = no`). The nRF52
+watchdog keeps running across a soft reset and the XIAO's stock bootloader (Adafruit-derived
+UF2 bootloader 0.6.1, S140 7.3.0) does not feed it, so touch → soft reset → DFU gets cut off
+~2 s in and leaves the bootloader in DFU mode with an invalid app (a second upload then
+works, but that is the recovery, not the flow). Instead `tools/upload_dfu.py`
+(`extra_scripts`, pre-upload) finds the board by USB VID 0x2886: a bootloader port (PID
+0x0044/0x0045) is used as-is; otherwise it opens the application port (PID 0x8044/0x8045),
+sends `DFU`, waits up to 15 s for the bootloader port and hands it to `adafruit-nrfutil`.
+`--upload-port` is optional. The firmware's `DFU` path is a double hop: outputs and rail to
+the safe state, request file `/dfu_req` in internal LittleFS (and a `.noinit` RAM word),
+stop kicking the watchdog → watchdog reset (the only reset that stops the WDT) → the freshly
+booted firmware sees the file before starting the watchdog, deletes it and performs the
+core's normal soft reset into serial DFU. `-Wl,--wrap=enterSerialDfu` routes the core's own
+`enterSerialDfu()` through this path, so a 1200-baud touch from other tools (Arduino IDE)
+also works, ~3 s slower. Measured: the bootloader clears `NRF_POWER->RESETREAS` before
+starting the app (`ID` → `rst=0x0`), and the `.noinit` word reads `0xFFFFFFFF` after a
+watchdog reset + bootloader pass (`RAMTEST WDT`), which is why the flash file is the
+mechanism that works.
 
 Build outputs: `.pio/build/xiao_nrf52840/firmware.hex` and `firmware.zip` (DFU package).
 
@@ -166,12 +214,13 @@ From FIRMWARE_HANDOFF §11 plus what the firmware work surfaced:
 
 | Item | Owner | Impact |
 |---|---|---|
-| **SPI mode to verify** on the bench (`VERIFY`; `SPIMODE 1` if mode 2 fails) | bring-up | Driver default; boot refuses to enable the rail until the readback passes |
-| **Channel map to measure** (FIRMWARE_HANDOFF §9 steps 2 and 4), then `CAL MAP` + `CAL SAVE` | bring-up | DAC side verified 2026-09-10 (`CDBA`); ADC side (`3210`) from the netlist, still to confirm with a valve on each pad |
+| **D7–D10 TVS diodes forward-biased on VOUTA–D** (§0) — every DAC output clamps at ~0.67 V | hardware | **Blocks bring-up step 2 onward.** Rotate 180° if the standoff is ≥ 11 V, fit a 12–15 V unidirectional SMA TVS the right way round, or remove for bring-up. Part number unknown (EasyEDA cloud library) — check before rotating |
+| ~~SPI mode to verify~~ — **resolved 2026-09-10**: mode 2, `VERIFY` → `pc=0x001F` | — | Driver default confirmed |
+| **Channel map**: DAC side verified 2026-09-10 (`CDBA`, netlist + DMM); ADC side (`3210`) from the netlist, still to confirm with a valve on each pad (FIRMWARE_HANDOFF §9 step 4) | bring-up | Default and saved config are `CDBA/3210`; `CAL MAP` + `CAL SAVE` if step 4 disagrees |
 | **CH4 monitor presence** — ITV0030-3BL may lack the monitor output | hardware / purchasing | `CAL RBEN 4` default; until known, expect `n/a` or an open-load report on CH4 |
-| **WDT vs. bootloader interaction.** The nRF52 WDT keeps running through a soft reset, so the 1200-baud touch into the bootloader relies on the bootloader feeding the WDT during DFU | bring-up | If `pio run -t upload` fails after a WDT-enabled firmware is on the board, use the double-tap UF2 route |
-| Update README §9 / SCHEMATIC_SPEC §10 (hardware repo) to the §5 map | docs | None — firmware uses the measured map |
-| Confirm XIAO plain vs. Sense (on Sense, check the IMU is not on D4/D5) | hardware | I²C pad conflict |
+| ~~WDT vs. bootloader interaction~~ — **resolved 2026-09-10.** The WDT does survive the soft reset and the bootloader does not feed it, so the stock 1200-baud touch was replaced by the `DFU` command + watchdog double hop with a flash-backed request (§5). `pio run -t upload` works from a running WDT-enabled firmware; double-tap UF2 remains the fallback | — | None |
+| Update README §9 / SCHEMATIC_SPEC §10 (hardware repo) to the `CDBA/3210` map and the D7–D10 orientation | docs | None — firmware uses the measured map |
+| ~~Confirm XIAO plain vs. Sense~~ — **resolved 2026-09-10**: Sense (PID 0x8045 stock); IMU not on D4/D5, no I²C conflict | — | None |
 | **Pneumatic shut-off solenoid driver** — not on this board revision | system | Adds one GPIO (D0/D1) to the boot sequence; **commissioning blocker regardless of firmware** — do not connect air until it exists |
 | BOM voltage-rating lock at JLC | hardware | None, but the board in hand may carry 25 V-rated caps on the 24 V rail |
 | `code_full_scale` and readback gain per channel to calibrate with a DMM | bring-up | Nominal until then; board reports `uncal` if nothing was saved |
@@ -179,17 +228,19 @@ From FIRMWARE_HANDOFF §11 plus what the firmware work surfaced:
 
 ## 7. Next steps
 
-1. **Bench bring-up**, no air, MainPower OFF until step 4 — README § Bench bring-up walks
-   FIRMWARE_HANDOFF §9 with the exact commands: `VERIFY` → `RAW` + DMM → `ADC 0` →
-   `RAIL ON` + `ADC n` → `CAL MAP` / `CAL SAVE` → `SET 1 50` + `GET 1` → step test with
-   `STATUS` → `HANG`.
-2. **Calibrate** `CAL FS` and `CAL RB` per channel against a DMM, `CAL SAVE`, confirm
+1. **Fix D7–D10** (§0, §6), then re-run bring-up step 2: `RAW X 2048` + `RAWGET X` + DMM
+   on each pad field; the outputs must reach ~5.3 V with no `!FAULT OC`.
+2. **Resume bench bring-up** from step 4, no air, MainPower ON — README § Bench bring-up
+   walks FIRMWARE_HANDOFF §9 with the exact commands: `RAIL ON` + `ADC n` with a valve on
+   each pad → `CAL MAP` / `CAL SAVE` only if the ADC side differs from `3210` → `SET 1 50`
+   + `GET 1` → step test with `STATUS` → `HANG`. (Steps 1 and 3 already pass.)
+3. **Calibrate** `CAL FS` and `CAL RB` per channel against a DMM, `CAL SAVE`, confirm
    `cal=ok` in `ID`.
-3. **GUI against real hardware**: connect, watch `HB` keep the link alive, confirm monitor
+4. **GUI against real hardware**: connect, watch `HB` keep the link alive, confirm monitor
    readbacks track presets, run `gui/profiles/quick_check.json`.
-4. **Verify the pressure endpoints against a gauge** once air is safe to connect (item 7
-   in §6 first).
-5. Later: pneumatic shut-off GPIO in the boot/stop sequence; GUI calibration editor
+5. **Verify the pressure endpoints against a gauge** once air is safe to connect (the
+   pneumatic shut-off item in §6 first).
+6. Later: pneumatic shut-off GPIO in the boot/stop sequence; GUI calibration editor
    (`CAL GET` → panels) so `REGULATORS` no longer needs manual sync; optional eFuse IMON
    on D1.
 

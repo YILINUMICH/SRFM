@@ -31,7 +31,7 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 
 | Command | Reply | Notes |
 |---|---|---|
-| `ID` | `OK SRFM-PCB v2.0 state=<state> map=<d1><d2><d3><d4>/<a1><a2><a3><a4> cal=<ok\|uncal> hb=<s\|off>` | `map` = DAC output letter (A–D) and ADC input number (0–3) per CH1..CH4, e.g. `CDBA/3210` (the netlist-verified map) |
+| `ID` | `OK SRFM-PCB v2.0 state=<state> map=<d1><d2><d3><d4>/<a1><a2><a3><a4> cal=<ok\|uncal> hb=<s\|off> rst=0x<reas> bootword=0x<word>` | `map` = DAC output letter (A–D) and ADC input number (0–3) per CH1..CH4, e.g. `CDBA/3210` (the netlist-verified map). `rst` = `NRF_POWER->RESETREAS` as seen at boot (the bootloader clears it before starting the app, so `0x0` is normal); `bootword` = the raw `.noinit` request word as seen at boot (diagnostic for `RAMTEST`; `0xFFFFFFFF` after a watchdog reset + bootloader pass) |
 | `SET <ch> <pct>` | `OK ch<n> pct=<p> code=<c>` | 0.0–100.0 % of the valve's full scale. Out of range → `ERR`, never clamped |
 | `SETALL <p1> <p2> <p3> <p4>` | `OK` | four percentages |
 | `P <ch> <pressure>` | `OK <name> p=<applied> v=<valve volts>` | engineering units (kPa) through the pressure calibration; **clamped** to the calibrated range like the old firmware, reply shows what was applied |
@@ -73,7 +73,8 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `ADC <0-3>` | `OK ain<n> code=<c> v=<pin volts>` | one raw single-ended conversion on a physical ADS1015 input (steps 3–4) |
 | `RAIL <ON\|OFF>` | `OK rail=<on\|off>` | drive SHDN directly (step 4). `ON` refused while FLT is latched |
 | `DUMP` | `OK ch1=<code>,<dacX>,<ainN>,<adc code>,<mon V> ; …` | raw per-channel view |
-| `DFU` | `OK entering bootloader` | outputs to zero, rail off, then into the serial-DFU bootloader (same path the 1200-baud touch of `pio run -t upload` uses) |
+| `DFU` | `OK entering bootloader` | outputs to zero, rail off, then into the serial-DFU bootloader. Two resets (~3 s): a request file `/dfu_req` is written to internal flash, the watchdog is allowed to fire (the only reset that stops it), and the next boot consumes the file and soft-resets into DFU. This is what `tools/upload_dfu.py` sends for `pio run -t upload`; a 1200-baud touch from other tools is wrapped onto the same path |
+| `RAMTEST <SOFT\|WDT>` | `OK resetting (<kind>)` | diagnostic only: outputs to zero, rail off, a test word into `.noinit` RAM, then a soft reset (`SOFT`) or a watchdog reset (`WDT`). The board resets; `ID` afterwards shows `bootword=` — `0x54455354` if the word survived. On the bench the word does **not** survive `WDT` + the bootloader pass (`0xFFFFFFFF`), which is why the DFU request lives in flash |
 | `HANG` | `OK hanging` | stalls the main loop to prove the watchdog (step 7): rail drops, DAC clears, board re-enumerates within ~2 s |
 
 ## Events (unsolicited, prefixed `!`)
