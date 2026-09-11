@@ -31,6 +31,8 @@ CAL MAP from the bench measurement, never assumed from the schematic.
 #include "ADS1015.h"
 #include "ValveConfig.h"
 #include "PressureControl.h"
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
 
 static const char *FW_ID = "SRFM-PCB v2.0";
 
@@ -98,6 +100,12 @@ static uint32_t lastHousekeepMs = 0;
 static char    lineBuf[128];
 static uint8_t lineLen = 0;
 static char    reply[400];   // CAL GET is the longest line (~280 chars)
+static uint32_t resetReason = 0;   // NRF_POWER->RESETREAS as seen at boot (diagnostic, shown by ID)
+static uint32_t bootWord = 0;      // raw .noinit request word as seen at boot (diagnostic, shown by ID)
+static const uint32_t DFU_REQUEST_MAGIC = 0x44465521UL;   // "DFU!"
+static const uint32_t RAM_TEST_MAGIC    = 0x54455354UL;   // "TEST" (RAMTEST diagnostic only)
+static const char    *DFU_REQUEST_PATH  = "/dfu_req";     // flash-backed copy of the request
+static uint32_t dfuRequest __attribute__((section(".noinit")));
 
 // --- small helpers -----------------------------------------------------
 static const char *stateName(BoardState s)
@@ -488,8 +496,8 @@ static void cmdId()
   char map[16], hb[8];
   replyMapString(map, sizeof(map));
   replyHb(hb, sizeof(hb));
-  printfln("OK %s state=%s map=%s cal=%s hb=%s", FW_ID, stateName(state), map,
-           store.calibrated() ? "ok" : "uncal", hb);
+  printfln("OK %s state=%s map=%s cal=%s hb=%s rst=0x%lX bootword=0x%lX", FW_ID, stateName(state), map,
+           store.calibrated() ? "ok" : "uncal", hb, (unsigned long)resetReason, (unsigned long)bootWord);
 }
 
 static void cmdGetAll()
@@ -864,6 +872,23 @@ static void handleLine(char *line)
     delay(50);
     __wrap_enterSerialDfu();
   }
+  else if (strcmp(cmd, "RAMTEST") == 0)
+  {
+    // Diagnostic: does the .noinit word survive a soft reset / a watchdog
+    // reset? Afterwards ID shows bootword=0x54455354 if it did.
+    char *a = strtok(nullptr, " 	");
+    if (a) for (char *p = a; *p; p++) *p = (char)toupper((unsigned char)*p);
+    if (a == nullptr || (strcmp(a, "SOFT") != 0 && strcmp(a, "WDT") != 0)) { printfln("ERR usage: RAMTEST <SOFT|WDT>"); return; }
+    printfln("OK resetting (%s)", a);
+    Serial.flush();
+    delay(50);
+    if (dacOk) zeroAllOutputs();
+    railSet(false);
+    dfuRequest = RAM_TEST_MAGIC;
+    if (a[0] == 'S') NVIC_SystemReset();
+    __disable_irq();
+    for (;;) { }
+  }
   else if (strcmp(cmd, "HANG") == 0)
   {
     printfln("OK hanging");
@@ -888,8 +913,17 @@ static void handleLine(char *line)
 // The core's enterSerialDfu() is redirected here with -Wl,--wrap (platformio.ini)
 // so the 1200-baud touch from `pio run -t upload` takes the same path as the
 // DFU host command.
-static const uint32_t DFU_REQUEST_MAGIC = 0x44465521UL;   // "DFU!"
-static uint32_t dfuRequest __attribute__((section(".noinit")));
+
+static void leaveRequest(uint32_t word)
+{
+  dfuRequest = word;
+  if (word == DFU_REQUEST_MAGIC)
+  {
+    // Flash copy: survives whatever the bootloader does to RAM in between.
+    Adafruit_LittleFS_Namespace::File f(InternalFS);
+    if (f.open(DFU_REQUEST_PATH, Adafruit_LittleFS_Namespace::FILE_O_WRITE)) { f.write((const uint8_t *)&word, sizeof(word)); f.close(); }
+  }
+}
 
 extern "C" void __real_enterSerialDfu(void);
 extern "C" void __wrap_enterSerialDfu(void)
@@ -899,28 +933,31 @@ extern "C" void __wrap_enterSerialDfu(void)
   digitalWrite(PIN_EFUSE_SHDN, LOW);
   dac.clearAssert();
   if (!(NRF_WDT->RUNSTATUS & WDT_RUNSTATUS_RUNSTATUS_Msk)) { __real_enterSerialDfu(); }
-  dfuRequest = DFU_REQUEST_MAGIC;
+  leaveRequest(DFU_REQUEST_MAGIC);
   __disable_irq();
   for (;;) { }                  // watchdog reset within WDT_TIMEOUT_MS
 }
 
+//! First thing in setup(), after the filesystem is mounted and before the
+//! watchdog starts: second hop of a DFU request. Consumes the request in
+//! both places, so it can never loop.
 static void honourDfuRequest()
 {
-  bool wdtReset = (NRF_POWER->RESETREAS & POWER_RESETREAS_DOG_Msk) != 0;
-  if (dfuRequest == DFU_REQUEST_MAGIC)
-  {
-    dfuRequest = 0;
-    if (wdtReset) __real_enterSerialDfu();   // never returns
-  }
+  resetReason = NRF_POWER->RESETREAS;
+  bootWord = dfuRequest;
+  bool requested = (dfuRequest == DFU_REQUEST_MAGIC);
   dfuRequest = 0;
-  if (wdtReset) NRF_POWER->RESETREAS = POWER_RESETREAS_DOG_Msk;   // write-1-to-clear
+  if (InternalFS.exists(DFU_REQUEST_PATH))
+  {
+    InternalFS.remove(DFU_REQUEST_PATH);
+    requested = true;
+  }
+  if (requested) __real_enterSerialDfu();   // never returns
 }
 
 // --- setup / loop ----------------------------------------------------------
 void setup()
 {
-  honourDfuRequest();   // before the watchdog starts: second hop of a DFU request
-
   // 1. GPIOs first, reproducing the pull-defined safe state explicitly.
   digitalWrite(PIN_EFUSE_SHDN, LOW);
   pinMode(PIN_EFUSE_SHDN, OUTPUT);
@@ -929,6 +966,7 @@ void setup()
   railCmd = false;
 
   store.begin();                          // internal flash: calibration + channel map
+  honourDfuRequest();                     // before the watchdog starts: second hop of a DFU request
 
   // 2. Buses. The core enables the nRF52's internal I2C pull-ups; the board
   //    has 4.7 k already, so disable them again (pin config only, TWIM untouched).

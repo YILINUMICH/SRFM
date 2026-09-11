@@ -31,12 +31,13 @@ def _ports():
 
 def _wait_for_bootloader(timeout_s):
     t0 = time.time()
-    while time.time() - t0 < timeout_s:
+    while True:
         for dev, pid in _ports():
             if pid in BOOT_PIDS:
                 return dev
+        if time.time() - t0 >= timeout_s:
+            return None
         time.sleep(0.2)
-    return None
 
 
 def enter_bootloader(source, target, env):
@@ -53,7 +54,9 @@ def enter_bootloader(source, target, env):
     if forced and forced in apps:
         apps = [forced]
     if not apps:
-        print("upload_dfu: no SRFM board found (VID 0x2886); leaving port as-is")
+        from serial.tools import list_ports
+        print("upload_dfu: no SRFM board found (VID 0x2886); leaving port as-is. Ports seen: %s"
+              % ", ".join("%s [%s]" % (p.device, p.hwid) for p in list_ports.comports()))
         return
 
     app = apps[0]
