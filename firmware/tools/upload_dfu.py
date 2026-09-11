@@ -6,7 +6,7 @@ Before adafruit-nrfutil runs, get the board into its bootloader:
   * otherwise open the application port (PID 0x8044/0x8045), send the DFU
     command, and wait for the bootloader port to appear.
 The firmware's DFU path takes two resets (~3 s) because of the watchdog;
-see src/main.cpp for why the stock 1200-baud touch is not used.
+see firmware/src/main.cpp for why the stock 1200-baud touch is not used.
 """
 import time
 

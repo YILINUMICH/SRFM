@@ -3,9 +3,9 @@
 
 Talks to the custom SRFM PCB (Seeed XIAO nRF52840 + AD5724R 4-channel DAC +
 ADS1015 monitor ADC) over USB CDC serial. Line-based protocol, one reply per
-command — see PROTOCOL.md at the repository root.
+command — see docs/PROTOCOL.md.
 
-Requires: pyserial  (pip install -r requirements.txt)
+Requires: pyserial  (pip install -r gui/requirements.txt)
 """
 
 import collections

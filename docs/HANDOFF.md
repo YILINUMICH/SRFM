@@ -21,11 +21,11 @@ Assembled SRFMV1 board, XIAO nRF52840 **Sense** (USB VID 0x2886; PID 0x8045 stoc
 
 | Item | Result |
 |---|---|
-| **Upload flow** (`pio run -t upload`) | **Works.** `tools/upload_dfu.py` sends `DFU`, the firmware takes the watchdog double hop (~3 s), `adafruit-nrfutil` flashes through the bootloader port. See §5 for the mechanism and why the stock 1200-baud touch is not used. Fallback double-tap reset → `XIAO-SENSE` → `pio run -t upload` also works |
+| **Upload flow** (`pio run -t upload`) | **Works.** `firmware/tools/upload_dfu.py` sends `DFU`, the firmware takes the watchdog double hop (~3 s), `adafruit-nrfutil` flashes through the bootloader port. See §5 for the mechanism and why the stock 1200-baud touch is not used. Fallback double-tap reset → `XIAO-SENSE` → `pio run -t upload` also works |
 | Measured, upload-related | The bootloader clears `NRF_POWER->RESETREAS` before starting the app (`ID` shows `rst=0x0`). A `.noinit` RAM word does **not** survive watchdog reset + bootloader pass (`RAMTEST WDT` → `bootword=0xFFFFFFFF`), so the DFU request has to live in flash (`/dfu_req`) |
 | Step 1 — SPI proof | **PASS** in SPI mode 2: `VERIFY` → `pc=0x001F`; `RAWGET` register readbacks return what was written |
 | Step 3 — I²C proof | **PASS**: ADS1015 ACKs at 0x48, inputs read ~0.02 V with nothing connected |
-| Channel map | From the SRFMV1 netlist (`SRFMV1/SRFMV1.tel`, now in the repo): VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3, VOUTA→R21→CMD4; AIN3/2/1/0 ← RD1/2/3/4. DAC side confirmed with a DMM (VOUTB seen on the CH3 pads). Firmware default and the saved config are now **`CDBA/3210`**. FIRMWARE_HANDOFF §5's `BACD` guess was wrong on the DAC side. ADC side still to be confirmed with a valve on each pad (step 4) |
+| Channel map | From the SRFMV1 netlist (`hardware/SRFMV1/SRFMV1.tel`, now in the repo): VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3, VOUTA→R21→CMD4; AIN3/2/1/0 ← RD1/2/3/4. DAC side confirmed with a DMM (VOUTB seen on the CH3 pads). Firmware default and the saved config are now **`CDBA/3210`**. FIRMWARE_HANDOFF §5's `BACD` guess was wrong on the DAC side. ADC side still to be confirmed with a valve on each pad (step 4) |
 | **Hardware fault — DAC outputs clamped** | Every DAC output hits its 20 mA current clamp at ~0.67 V with nothing connected (`!FAULT OC n`, power-control readback OC bit set). The netlist shows TVS diodes **D7–D10** (SMA footprint, same as D2 on the 24 V rail) with pin 1 on GND and pin 2 on VOUTA–D, i.e. **forward-biased from the DAC output to ground**; D2 has pin 1 on +24V (the correct TVS orientation). Measurements on U3: pin 24 AVDD 14.69 V, pin 1 AVSS 0 V, pin 14 DVCC 3.3 V, pin 17 REFOUT 2.5 V, pin 4 VOUTB 0.7 V when commanded 5.08 V; the pad tracks the DAC exactly below the clamp (0.527 V commanded → 0.532 V measured). **Fix pending:** rotate D7–D10 180° (only if their standoff is ≥ 11 V), or replace with a 12–15 V unidirectional SMA TVS in the correct orientation, or remove them for bring-up. Part number of D7–D10 unknown (EasyEDA cloud library only) |
 | `!FAULT FLT` at boot with 24 V absent | Expected: FLT reads low while the eFuse is unpowered. `CLEARFAULT` / `START` recovers once 24 V is present |
 | XIAO variant | **Sense** (PID 0x8045 stock). Closes the plain-vs-Sense open item; the IMU is not on D4/D5, no I²C conflict |
@@ -87,27 +87,27 @@ thing in a hardware-guaranteed safe state whenever it is not deliberately runnin
 
 | Path | Purpose |
 |---|---|
-| `platformio.ini` | env `xiao_nrf52840`: `nordicnrf52@~10.9.0`, Arduino framework (Adafruit nRF52 core, `framework-arduinoadafruitnrf52` 1.6.1), `upload_protocol = nrfutil`, monitor 115200; `build_flags = -Wl,--wrap=enterSerialDfu`, `extra_scripts = tools/upload_dfu.py`, `board_upload.use_1200bps_touch = no`, `board_upload.wait_for_upload_port = no` (see §5) |
-| `tools/upload_dfu.py` | pre-upload hook: finds the board by USB VID 0x2886, uses a bootloader port if present, otherwise sends `DFU` to the application port and waits ≤ 15 s for the bootloader port |
-| `boards/xiao_nrf52840.json` | board definition (see §5) |
-| `SRFMV1/` | board fab outputs and the netlist `SRFMV1.tel` (source of the channel map and the D7–D10 finding) |
-| `variants/Seeed_XIAO_nRF52840/variant.{h,cpp}` | pin map, copied from Seeed's Arduino core |
-| `linker/nrf52840_s140_v7.ld` | application at `0x27000`, RAM from `0x20006000` (see §5) |
-| `lib/AD5724R/` | DAC driver |
-| `lib/ADS1015/` | ADC driver |
-| `lib/ValveConfig/` | persisted calibration/config struct |
-| `lib/PressureControl/` | pressure ↔ valve-voltage mapping (carried over from `main`, re-indexed) |
-| `lib/ITV0030-3BL.pdf`, `lib/ITV2090-312L5.PDF` | valve datasheets |
-| `src/main.cpp` | boot sequence, watchdog, heartbeat, fault handling, protocol |
+| `platformio.ini` | env `xiao_nrf52840`: `nordicnrf52@~10.9.0`, Arduino framework (Adafruit nRF52 core, `framework-arduinoadafruitnrf52` 1.6.1), `upload_protocol = nrfutil`, monitor 115200; `build_flags = -Wl,--wrap=enterSerialDfu`, `extra_scripts = firmware/tools/upload_dfu.py`, `board_upload.use_1200bps_touch = no`, `board_upload.wait_for_upload_port = no` (see §5) |
+| `firmware/tools/upload_dfu.py` | pre-upload hook: finds the board by USB VID 0x2886, uses a bootloader port if present, otherwise sends `DFU` to the application port and waits ≤ 15 s for the bootloader port |
+| `firmware/boards/xiao_nrf52840.json` | board definition (see §5) |
+| `hardware/SRFMV1/` | board fab outputs and the netlist `SRFMV1.tel` (source of the channel map and the D7–D10 finding) |
+| `firmware/variants/Seeed_XIAO_nRF52840/variant.{h,cpp}` | pin map, copied from Seeed's Arduino core |
+| `firmware/linker/nrf52840_s140_v7.ld` | application at `0x27000`, RAM from `0x20006000` (see §5) |
+| `firmware/lib/AD5724R/` | DAC driver |
+| `firmware/lib/ADS1015/` | ADC driver |
+| `firmware/lib/ValveConfig/` | persisted calibration/config struct |
+| `firmware/lib/PressureControl/` | pressure ↔ valve-voltage mapping (carried over from `main`, re-indexed) |
+| `hardware/datasheets/ITV0030-3BL.pdf`, `hardware/datasheets/ITV2090-312L5.PDF` | valve datasheets |
+| `firmware/src/main.cpp` | boot sequence, watchdog, heartbeat, fault handling, protocol |
 | `gui/pressure_gui.py`, `gui/profiles/` | tkinter GUI and JSON test profiles |
-| `requirements.txt` | `pyserial>=3.5` |
+| `gui/requirements.txt` | `pyserial>=3.5` |
 | `README.md` | user-facing: hardware summary, deployment, bring-up, protocol summary, GUI |
 
 ## 3. Architecture (layers)
 
 ### Layer 1 — device drivers
 
-**`lib/AD5724R/`** — AD5724R quad 12-bit DAC over SPI.
+**`firmware/lib/AD5724R/`** — AD5724R quad 12-bit DAC over SPI.
 
 - Bus: SPI **mode 2** (SCLK idles high, data latched on the falling edge), MSB first,
   ≤ 4 MHz, **24-bit frames** with SYNC low for the whole frame; the write takes effect on
@@ -126,7 +126,7 @@ thing in a hardware-guaranteed safe state whenever it is not deliberately runnin
   power-control read also carries status: DB5 TSD, DB7–DB10 OCA–OCD (output clamp active).
 - "All four" (ADDR 100) is used only for range and clear, never for value writes.
 
-**`lib/ADS1015/`** — ADS1015 4-channel 12-bit ADC over I²C.
+**`firmware/lib/ADS1015/`** — ADS1015 4-channel 12-bit ADC over I²C.
 
 - Address **0x48**, registers 0x00 conversion / 0x01 config, 16-bit big-endian.
 - Single-shot per reading: config with OS = 1, MUX `1xx` for single-ended AIN0–3, PGA
@@ -138,7 +138,7 @@ thing in a hardware-guaranteed safe state whenever it is not deliberately runnin
 
 ### Layer 2 — configuration and mapping
 
-**`lib/ValveConfig/`** — one struct, persisted in internal flash as LittleFS file
+**`firmware/lib/ValveConfig/`** — one struct, persisted in internal flash as LittleFS file
 `/srfm_cal.bin` with a version field and a CRC. Per channel: DAC address (A–D), ADC input
 (0–3), `code_full_scale` (default 3851 for CH1–3 / 3831 for CH4), readback gain and offset
 (default 3.19 mV/code, 0), `readback_enabled`, pressure endpoints (vMin/vMax/pMin/pMax).
@@ -146,14 +146,14 @@ Global: heartbeat timeout (default 2 s). On a missing or invalid record the nomi
 are used and the board reports **`cal=uncal`**. Edited over the host link with `CAL …`,
 written with `CAL SAVE`.
 
-**`lib/PressureControl/`** — the linear pressure ↔ valve-voltage map from `main`
+**`firmware/lib/PressureControl/`** — the linear pressure ↔ valve-voltage map from `main`
 (`voltage = vMin + (p − pMin)·(vMax − vMin)/(pMax − pMin)`, clamped to the calibrated
 range, vacuum handled as `pMin > pMax`), now keyed by 1-indexed channel and fed from the
 ValveConfig endpoints rather than a compile-time table. Valve voltage → DAC code goes
 through `code_full_scale` so "10 V" means 10.000 V *at the valve* behind the 100 Ω series
 resistor: `code = clamp(round(fraction × code_full_scale), 0, code_full_scale)`.
 
-### Layer 3 — firmware (`src/main.cpp`)
+### Layer 3 — firmware (`firmware/src/main.cpp`)
 
 - **Boot** (FIRMWARE_HANDOFF §6, in order): pins to the pulled state → SPI/I²C → watchdog
   → CLR high → power control `0x001F` → range +10.8 V → control (clamp, TSD) → code 0 ×4 →
@@ -212,9 +212,9 @@ headers and a v6 linker script, while the XIAO's stock bootloader flashes **S140
 
 | File | What it does |
 |---|---|
-| `boards/xiao_nrf52840.json` | `core: nRF5`, `bsp: adafruit`, `variant: Seeed_XIAO_nRF52840` with `variants_dir: variants`, `softdevice: s140 6.1.1, sd_fwid 0x0123`, `ldscript: linker/nrf52840_s140_v7.ld`, `bootloader.settings_addr 0xFF000`, USB VID/PID `0x2886:0x8044` / `0x0044`, `upload: nrfutil`, 1200-bps touch (overridden to off in `platformio.ini`), `maximum_size 811008`, `maximum_ram_size 237568` |
-| `variants/Seeed_XIAO_nRF52840/` | Seeed's `variant.h`/`variant.cpp`: `SPI` on D8/D9/D10, `Wire` on D4/D5, `USE_LFXO` |
-| `linker/nrf52840_s140_v7.ld` | `FLASH ORIGIN = 0x27000, LENGTH = 0xED000 − 0x27000`; `RAM ORIGIN = 0x20006000`; `.svc_data`/`.fs_data` sections; `INCLUDE "nrf52_common.ld"` from the core |
+| `firmware/boards/xiao_nrf52840.json` | `core: nRF5`, `bsp: adafruit`, `variant: Seeed_XIAO_nRF52840` with `variants_dir: firmware/variants`, `softdevice: s140 6.1.1, sd_fwid 0x0123`, `ldscript: firmware/linker/nrf52840_s140_v7.ld`, `bootloader.settings_addr 0xFF000`, USB VID/PID `0x2886:0x8044` / `0x0044`, `upload: nrfutil`, 1200-bps touch (overridden to off in `platformio.ini`), `maximum_size 811008`, `maximum_ram_size 237568` |
+| `firmware/variants/Seeed_XIAO_nRF52840/` | Seeed's `variant.h`/`variant.cpp`: `SPI` on D8/D9/D10, `Wire` on D4/D5, `USE_LFXO` |
+| `firmware/linker/nrf52840_s140_v7.ld` | `FLASH ORIGIN = 0x27000, LENGTH = 0xED000 − 0x27000`; `RAM ORIGIN = 0x20006000`; `.svc_data`/`.fs_data` sections; `INCLUDE "nrf52_common.ld"` from the core |
 
 The 6.1.1 headers are API-compatible for the SoC calls this firmware makes (no BLE; the
 SoftDevice is present only because the bootloader expects it). `sd_fwid 0x0123` is what
@@ -229,7 +229,7 @@ disabled (`board_upload.use_1200bps_touch = no`, `wait_for_upload_port = no`). T
 watchdog keeps running across a soft reset and the XIAO's stock bootloader (Adafruit-derived
 UF2 bootloader 0.6.1, S140 7.3.0) does not feed it, so touch → soft reset → DFU gets cut off
 ~2 s in and leaves the bootloader in DFU mode with an invalid app (a second upload then
-works, but that is the recovery, not the flow). Instead `tools/upload_dfu.py`
+works, but that is the recovery, not the flow). Instead `firmware/tools/upload_dfu.py`
 (`extra_scripts`, pre-upload) finds the board by USB VID 0x2886: a bootloader port (PID
 0x0044/0x0045) is used as-is; otherwise it opens the application port (PID 0x8044/0x8045),
 sends `DFU`, waits up to 15 s for the bootloader port and hands it to `adafruit-nrfutil`.

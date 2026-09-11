@@ -22,30 +22,37 @@ Mega 2560 + LTC2668 EVM version lives on `main` — see
 
 Two documents are authoritative and this README only summarises them:
 
-- [`FIRMWARE_HANDOFF.md`](FIRMWARE_HANDOFF.md) — hardware → firmware handoff:
+- [`FIRMWARE_HANDOFF.md`](docs/FIRMWARE_HANDOFF.md) — hardware → firmware handoff:
   pin map, register sequences, boot order, safety invariants, bring-up.
-- [`PROTOCOL.md`](PROTOCOL.md) — the host command set.
+- [`PROTOCOL.md`](docs/PROTOCOL.md) — the host command set.
 
 ## Project layout
 
 | Path | What it is |
 |---|---|
 | `platformio.ini` | PlatformIO config, env `xiao_nrf52840` (nordicnrf52, Adafruit nRF52 core) |
-| `boards/xiao_nrf52840.json` | Board definition — PlatformIO has no stock XIAO nRF52840 |
-| `variants/Seeed_XIAO_nRF52840/` | Pin-map variant, copied from Seeed's Arduino core |
-| `linker/nrf52840_s140_v7.ld` | Linker script placing the application at `0x27000` (SoftDevice S140 7.x) |
-| `tools/upload_dfu.py` | PlatformIO pre-upload hook: finds the board by USB VID, sends `DFU`, waits for the bootloader port (see [Deployment](#deployment)) |
-| `SRFMV1/` | Board fab files and the netlist `SRFMV1.tel` the channel map was read from |
-| `lib/AD5724R/` | AD5724R SPI DAC driver (24-bit frames, SPI mode 2, register readback) |
-| `lib/ADS1015/` | ADS1015 I²C ADC driver (single-shot, averaging) |
-| `lib/ValveConfig/` | Persisted calibration/config struct (channel map, full-scale codes, readback gain/enable, pressure endpoints, heartbeat timeout) — version + CRC in LittleFS `/srfm_cal.bin` |
-| `lib/PressureControl/` | Pressure ↔ valve-voltage linear mapping |
-| `src/main.cpp` | Firmware: boot sequence, watchdog, heartbeat, fault handling, host protocol |
-| `gui/pressure_gui.py` | tkinter GUI (needs `pip install -r requirements.txt`) |
+| `firmware/boards/xiao_nrf52840.json` | Board definition — PlatformIO has no stock XIAO nRF52840 |
+| `firmware/variants/Seeed_XIAO_nRF52840/` | Pin-map variant, copied from Seeed's Arduino core |
+| `firmware/linker/nrf52840_s140_v7.ld` | Linker script placing the application at `0x27000` (SoftDevice S140 7.x) |
+| `firmware/tools/upload_dfu.py` | PlatformIO pre-upload hook: finds the board by USB VID, sends `DFU`, waits for the bootloader port (see [Deployment](#deployment)) |
+| `hardware/SRFMV1/` | Board fab files and the netlist `SRFMV1.tel` the channel map was read from |
+| `firmware/lib/AD5724R/` | AD5724R SPI DAC driver (24-bit frames, SPI mode 2, register readback) |
+| `firmware/lib/ADS1015/` | ADS1015 I²C ADC driver (single-shot, averaging) |
+| `firmware/lib/ValveConfig/` | Persisted calibration/config struct (channel map, full-scale codes, readback gain/enable, pressure endpoints, heartbeat timeout) — version + CRC in LittleFS `/srfm_cal.bin` |
+| `firmware/lib/PressureControl/` | Pressure ↔ valve-voltage linear mapping |
+| `firmware/src/main.cpp` | Firmware: boot sequence, watchdog, heartbeat, fault handling, host protocol |
+| `hardware/datasheets/` | SMC ITV0030 / ITV2090 catalogue pages (set-pressure ranges, sensitivity, monitor spec) |
+| `gui/pressure_gui.py` | tkinter GUI (needs `pip install -r gui/requirements.txt`) |
 | `gui/profiles/` | JSON test profiles for long unattended runs, with their own [README](gui/profiles/README.md) |
-| `FIRMWARE_HANDOFF.md` | Hardware → firmware handoff (authoritative for pins, registers, safety) |
-| `PROTOCOL.md` | Host protocol (authoritative for commands and replies) |
-| `HANDOFF.md` | Project handoff: architecture, design decisions, open items |
+| `data/` | CSV recordings written by the GUI, one per connection (created on first use, git-ignored) |
+| `docs/FIRMWARE_HANDOFF.md` | Hardware → firmware handoff (authoritative for pins, registers, safety) |
+| `docs/PROTOCOL.md` | Host protocol (authoritative for commands and replies) |
+| `docs/HANDOFF.md` | Project handoff: architecture, design decisions, open items, bench status |
+
+Top level: `platformio.ini` stays at the root so `pio run` works from a fresh
+checkout; it points PlatformIO at `firmware/` (`src_dir`, `lib_dir`,
+`boards_dir`). Everything else is grouped by what it is — `firmware/`,
+`gui/`, `hardware/`, `docs/` — with `data/` for recordings.
 
 ## Hardware
 
@@ -76,7 +83,7 @@ The pulls define the **hardware safe state**: whenever the MCU's pins are
 high-Z (before boot, during reset, after a watchdog reset) CLR is asserted
 (DAC 0 V) and SHDN is low (24 V off). Firmware only ever *leaves* that state,
 deliberately and in order. Full detail, bus settings and register values:
-[`FIRMWARE_HANDOFF.md`](FIRMWARE_HANDOFF.md) §1–§4.
+[`FIRMWARE_HANDOFF.md`](docs/FIRMWARE_HANDOFF.md) §1–§4.
 
 ### Channels
 
@@ -91,15 +98,17 @@ silkscreen.
 | 4 | SMC ITV0030-3BL (air pressure) | `AIR` | +1 … +500 kPa | VOUT **A** (R21) | AIN **0** |
 
 > **The physical map above is verified.** It comes from the SRFMV1 netlist
-> (`SRFMV1/SRFMV1.tel`: VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3,
+> (`hardware/SRFMV1/SRFMV1.tel`: VOUTC→R18→CMD1, VOUTD→R19→CMD2, VOUTB→R20→CMD3,
 > VOUTA→R21→CMD4; AIN3…AIN0 ← RD1…RD4) and was confirmed on the bench on
 > 2026-09-10 (VOUTB measured on the CH3 pads). It is the firmware default
 > (`map=CDBA/3210`). The Gerber-review prediction in FIRMWARE_HANDOFF §5
 > (`BACD`) was wrong on the DAC side.
 
-CH4's ITV0030-3BL may have no monitor output at all. Its readback can be
-disabled (`CAL RBEN 4 0`), in which case it reports `n/a` and never raises an
-open-load fault.
+The SMC catalogue (`hardware/datasheets/`) lists the 1–5 V analog monitor
+output as standard on the ITV0000 series, so CH4's ITV0030-3BL should have
+one; the order code has no monitor option digit either way. If the bench
+shows nothing on its RD4 pad, its readback can be disabled (`CAL RBEN 4 0`),
+in which case it reports `n/a` and never raises an open-load fault.
 
 ## Deployment
 
@@ -108,7 +117,7 @@ From a fresh checkout to a running system.
 **1. Install the tools.** Needs Python 3.9 or newer:
 
 ```sh
-pip install -r requirements.txt     # pyserial, for the GUI
+pip install -r gui/requirements.txt     # pyserial, for the GUI
 pip install platformio              # firmware toolchain
 ```
 
@@ -122,7 +131,7 @@ pio run -t upload                   # flash via the stock bootloader (serial DFU
 The upload uses `adafruit-nrfutil` serial DFU through the XIAO's stock
 bootloader; PlatformIO fetches the tool itself. PlatformIO's own 1200-baud
 touch is **not** used (`board_upload.use_1200bps_touch = no`). Instead the
-pre-upload hook `tools/upload_dfu.py` finds the board by USB VID 0x2886: if a
+pre-upload hook `firmware/tools/upload_dfu.py` finds the board by USB VID 0x2886: if a
 bootloader port (PID 0x0044/0x0045) is already there it uses it; otherwise it
 opens the application port (PID 0x8044/0x8045), sends the `DFU` command,
 waits up to 15 s for the bootloader port to appear and hands that port to
@@ -145,14 +154,14 @@ firmware sees the file before starting the watchdog, deletes it and performs
 the core's normal soft reset into serial DFU. The core's `enterSerialDfu()`
 is redirected to this path with `-Wl,--wrap=enterSerialDfu`, so a 1200-baud
 touch from other tools (Arduino IDE) also works, just slower (~3 s). Verified
-on the bench 2026-09-10; see [`HANDOFF.md`](HANDOFF.md) § Bench status.
+on the bench 2026-09-10; see [`HANDOFF.md`](docs/HANDOFF.md) § Bench status.
 
 The toolchain is not stock: the repo carries the board JSON, the pin variant
 and a linker script because PlatformIO does not know the XIAO nRF52840 and
 its core package only ships SoftDevice 6.1.1 headers, while the XIAO's
 bootloader carries S140 7.3.0. The 6.1.1 headers are API-compatible for the
 SoC calls this firmware makes; the linker script puts the application at
-`0x27000` where the 7.x SoftDevice expects it. See [`HANDOFF.md`](HANDOFF.md)
+`0x27000` where the 7.x SoftDevice expects it. See [`HANDOFF.md`](docs/HANDOFF.md)
 § Toolchain.
 
 **Fallback — UF2 via the bootloader.** If serial DFU fails or the firmware
@@ -212,10 +221,62 @@ Pick the port, press Connect, and the four valve panels go live.
 > cables power the board and enumerate nothing. Try a different cable and a
 > direct port rather than a hub before suspecting the board.
 
+## A typical session
+
+What happens from Connect to Disconnect, in order. Everything here is
+covered in more detail under [GUI](#gui) and in
+[`PROTOCOL.md`](docs/PROTOCOL.md).
+
+1. **Connect.** The GUI sends `ID` and `GET`, then `STREAM 100`. The board
+   starts sending one timestamped sample per 10 ms and the panels, the plot
+   and the recording all run off that. The first sample opens
+   `data/srfm_<date>_<time>.csv`; the bottom bar shows the file and its row
+   count. Nothing to press. (If the board runs firmware without `STREAM`,
+   the GUI says so once and polls `GET` at 2 Hz instead.)
+2. **Set pressures.** Preset buttons, a typed pressure (clamped to the
+   valve's range and rounded to its step — the panel says if it changed
+   what you typed), or a raw command voltage for debugging. Each panel shows
+   three readback lines: *commanded* (the setpoint), *valve* (the 0–10 V
+   command at the valve's input pin) and *monitor* (what the valve reports
+   back on its 1–5 V monitor pin, as volts, % of span and kPa).
+3. **Watch.** *Live plot…* shows the last 60 s of command vs. readback per
+   channel. `!FAULT` lines land in the log and in the bar at the top; a
+   stuck valve, open monitor line or lost rail is reported, not acted on.
+4. **Run a profile** for anything long: *Script…* loads a JSON sequence of
+   held setpoints from `gui/profiles/`, locks the manual controls while it
+   runs, and *Stop* ends it within a quarter second. Step markers go into
+   the recording as event rows next to the samples.
+5. **Stop.** `CLEAR` zeroes one valve, `ZERO ALL` zeroes all four with the
+   rail up, `STOP` zeroes then drops the 24 V rail (`START` brings it
+   back), `CLEARFAULT` is the only way out of a latched eFuse fault.
+6. **Disconnect** (or close the window, which also sends `ZERO`). The GUI
+   sends `STREAM 0`, the CSV closes, and the next Connect starts a new one.
+
+**The data.** One CSV per connection. Sample rows carry host time, seconds
+since the file opened, the board's millisecond stamp (`fw_ms`, the clock to
+use for rate work) and per channel `set_kPa, cmd_V, mon_V, mon_pct,
+mon_kPa`; every logged line (commands sent, replies, faults, profile
+markers) is an event row with the channel columns empty. In pandas,
+`df[df.event == ""]` is the numeric data and `df[df.event != ""]` the
+timeline. 100 Hz streaming is roughly 60 MB per hour.
+
+**From a terminal instead** (`pio device monitor`, or any serial tool):
+send `HBT 0` first so the 2 s link-loss timer does not stop the board
+between hand-typed commands, then `STREAM 100` to watch the `~` lines,
+`STREAM 0` to stop them. Only one program can hold the port, so close the
+terminal before starting the GUI.
+
+**Rates, for reference.** The board sweeps the four monitors at 10 Hz on
+its own and at 100 Hz while streaming (ADS1015 at 3300 SPS, 2 samples
+averaged). The GUI records every sample, redraws the panels at 10 Hz and
+the plot at 4 Hz. Faster than 100 Hz gains nothing: the monitor front end
+rolls off around 50 Hz, the valves respond in ~0.1 s, and the monitor is a
+±6 % F.S. signal.
+
 ## Safety
 
 The rules the firmware implements (FIRMWARE_HANDOFF §6–§7). Read them before
-changing `src/main.cpp`.
+changing `firmware/src/main.cpp`.
 
 **Boot order** — leave the hardware safe state in exactly this sequence:
 GPIOs to the pulled state (SYNC high, CLR low, SHDN low) → SPI/I²C init →
@@ -260,10 +321,14 @@ FIRMWARE_HANDOFF §9, with the exact commands. **No air connected. MainPower
 switch OFF until step 4.** Open `pio device monitor` and send `HBT 0` first
 so the heartbeat does not interrupt you.
 
-> **Where it stands (2026-09-10):** steps 1–3 pass. Step 2 is blocked by a
-> board fault — every DAC output hits its 20 mA clamp at ~0.67 V because the
-> TVS diodes D7–D10 on VOUTA–D are fitted forward-biased to ground. Fix them
-> before continuing (details in [`HANDOFF.md`](HANDOFF.md) § Bench status).
+> **Where it stands (2026-09-11):** steps 1–4 and 7 pass on the assembled
+> board. The TVS diodes D7–D10 (fitted backwards, clamping every DAC output
+> at ~0.67 V) have been reworked and all four outputs sweep 0–10.15 V clean;
+> the channel map `CDBA/3210` is measured on both sides and saved in flash.
+> Remaining: step 5 (loopback with real valves), step 6 (cross-coupling),
+> then `CAL FS` / `CAL RB` per channel. The `STREAM` firmware added
+> 2026-09-11 compiles but has not been flashed or run on the board yet.
+> Details in [`HANDOFF.md`](docs/HANDOFF.md) § Bench status.
 
 **1. SPI proof.** `STATUS` should show `state=READY` (or `state=FAULT
 reason=SPI` when the DAC readback failed, in which case the rail stays off).
@@ -294,9 +359,11 @@ not land" from "the output stage is not delivering". Whichever pad reads
 (VOUTA→R21→CMD4). Repeat `RAW B 2048`, `RAW C 2048`, `RAW D 2048` (writing
 `RAW X 0` in between) and note the pad for each letter. A result different
 from the [channel table](#channels) is not a firmware problem — record what
-you measured. *Bench 2026-09-10: VOUTB seen on the CH3 pads, confirming the
-netlist; but the pads only track the DAC below ~0.67 V and `!FAULT OC n`
-fires above — see the D7–D10 note above.*
+you measured. *Bench 2026-09-10: PASS. VOUTB seen on the CH3 pads,
+confirming the netlist. Before the D7–D10 rework the pads only tracked the
+DAC below ~0.67 V with `!FAULT OC n` above; after it every output sweeps
+0–10.15 V with the clamp bit never set, with a +0.6 % gain error that
+`CAL FS` absorbs.*
 
 **3. I²C proof.** The ADS1015 must ACK at 0x48 and read near zero with
 nothing driving its inputs:
@@ -325,7 +392,8 @@ ADC 3
 ```
 
 The input that rises to ~1 V (code ≈ 314, 0 % F.S.) is wired to CH1 — expect
-AIN3 (netlist: AIN3/2/1/0 ← RD1/2/3/4; not yet confirmed with a valve). Repeat
+AIN3 (netlist: AIN3/2/1/0 ← RD1/2/3/4; *bench 2026-09-10: PASS, confirmed
+by jumpering a driven CMD pad to each RD pad in turn*). Repeat
 for the CH2, CH3 and CH4 pad fields. If the measured map differs from the
 default `CDBA/3210`, enter it (DAC letter from step 2, ADC input from this
 step) and save it — `CAL MAP` swaps DAC outputs between channels when the
@@ -375,12 +443,14 @@ HANG                   → OK hanging
 
 The main loop stalls. Within ~2 s the rail must drop (`FuseGood` off), the
 DAC must clear to 0 V, and the board must re-enumerate on USB and print a new
-`!READY`. Reconnect the monitor afterwards.
+`!READY`. Reconnect the monitor afterwards. *Bench 2026-09-10: PASS — the USB
+port dropped at 1.15 s and the board was back, READY with the rail up, at
+1.98 s.*
 
 ## Host protocol (115200, one reply line per command)
 
 Summary only — replies, edge cases and the full bench command set are in
-[`PROTOCOL.md`](PROTOCOL.md). Commands are case-insensitive; every command
+[`PROTOCOL.md`](docs/PROTOCOL.md). Commands are case-insensitive; every command
 gets exactly one `OK …` / `ERR …` / `FAULT …` line, and asynchronous events
 arrive as extra `!…` lines.
 
@@ -485,7 +555,8 @@ last 60 s of the command voltage (blue) and the readback (red) on the same
 0–10 V scale. The readback is the valve's monitor pin mapped onto the
 command range (1 V → 0 V, 5 V → 10 V); the raw monitor voltage is in each
 pane's header, and the red trace is left blank while there is no monitor
-signal. It is fed by the live-readback poll, so it needs that box ticked.
+signal. It is fed by whatever is delivering samples — the 100 Hz stream, or
+the 2 Hz poll when streaming is off — and redraws four times a second.
 Plain Tk canvases, no extra dependency.
 
 **Recording is automatic.** The first status reply after Connect opens
@@ -551,5 +622,5 @@ reference.**
 | Host link loss | ignored | heartbeat timeout → stop sequence |
 | Calibration | compile-time defaults, `CAL` lost on reset | persisted in flash with version + CRC; `uncal` flag |
 | Protocol | `OK SRFM-DAC v1.0`, `SPAN`, `DUMP` for 16 channels | `OK SRFM-PCB v2.0`, `SET`/`SETALL`/`STATUS`/`STOP`/`START`/`HB`, bench commands, `!` events |
-| Flashing | avrdude | serial DFU via bootloader (`DFU` command + watchdog double hop, `tools/upload_dfu.py`), UF2 fallback; no SWD |
+| Flashing | avrdude | serial DFU via bootloader (`DFU` command + watchdog double hop, `firmware/tools/upload_dfu.py`), UF2 fallback; no SWD |
 | Board state | always live | `READY` / `STOPPED` / `FAULT` gate every output command |

@@ -25,7 +25,7 @@
     "usb_product": "XIAO nRF52840",
     "mcu": "nrf52840",
     "variant": "Seeed_XIAO_nRF52840",
-    "variants_dir": "variants",
+    "variants_dir": "firmware/variants",
     "bsp": {
       "name": "adafruit"
     },
@@ -38,7 +38,7 @@
     "bootloader": {
       "settings_addr": "0xFF000"
     },
-    "ldscript": "linker/nrf52840_s140_v7.ld"
+    "ldscript": "firmware/linker/nrf52840_s140_v7.ld"
   },
   "connectivity": [
     "bluetooth"
