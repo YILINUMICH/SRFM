@@ -31,6 +31,11 @@ VOLT_MIN, VOLT_MAX = 0.0, 10.0
 # The firmware drops the 24 V rail if it hears nothing for the heartbeat
 # timeout (HBT, default 2 s). Sending every second leaves a safe margin.
 HEARTBEAT_MS = 1000
+# Live readback: while enabled, the heartbeat tick sends GET instead of HB
+# (any valid command satisfies the firmware's link-loss timer) and the
+# reply refreshes the panels without being logged. The firmware sweeps the
+# monitors at ~10 Hz, so twice a second is plenty for a display.
+LIVE_MS = 500
 
 # Delay after opening the port before the first command. The XIAO does not
 # reset when the port opens, so this only has to cover CDC settling.
@@ -643,6 +648,7 @@ class App(tk.Tk):
         self._refresh_job = None
         self._hb_job = None
         self._hb_pending = 0  # HB acks still to arrive (and be dropped from the log)
+        self._live_pending = 0  # periodic GET replies still to arrive (applied, not logged)
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -660,6 +666,9 @@ class App(tk.Tk):
         # an ID / STATUS reply.
         self.board = ttk.Label(bar, text="", foreground="#444")
         self.board.pack(side="left", padx=6)
+        self.live_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Live readback", variable=self.live_var,
+                        command=self.restart_heartbeat).pack(side="right", padx=6)
 
         # --- regulator panels, one per column, in channel order ---
         self.panels = {}
@@ -741,6 +750,7 @@ class App(tk.Tk):
         self.after(CONNECT_SETTLE_MS, lambda: self.send_if_connected("ID"))
         self.after(CONNECT_SETTLE_MS + 200, lambda: self.send_if_connected("GET"))
         self._hb_pending = 0
+        self._live_pending = 0
         self._hb_job = self.after(HEARTBEAT_MS, self.heartbeat)
 
     def disconnect_link(self, reason):
@@ -770,25 +780,44 @@ class App(tk.Tk):
     # --- heartbeat ---
 
     def heartbeat(self):
-        """Send HB and reschedule. Not logged: one line a second would bury
-        everything else, so the HB and its bare OK are both kept out."""
+        """Keep the link alive and, in live mode, refresh the readbacks.
+
+        Sends GET (live) or HB, then reschedules. Neither the command nor its
+        reply is logged: one line every half second would bury everything
+        else. A live GET's status reply still reaches the panels through
+        handle_line, which counts the outstanding periodic replies so a GET
+        the user pressed by hand is logged as before.
+        """
         self._hb_job = None
         if not self.link.connected:
             return
+        live = bool(self.live_var.get())
         try:
-            self.link.send("HB")
+            self.link.send("GET" if live else "HB")
         except (RuntimeError, serial.SerialException) as exc:
             self.log_line(f"! heartbeat failed: {exc}")
             self.disconnect_link("port lost")
             return
-        self._hb_pending += 1
-        self._hb_job = self.after(HEARTBEAT_MS, self.heartbeat)
+        if live:
+            self._live_pending += 1
+        else:
+            self._hb_pending += 1
+        self._hb_job = self.after(LIVE_MS if live else HEARTBEAT_MS, self.heartbeat)
+
+    def restart_heartbeat(self):
+        """Live checkbox toggled: apply the new mode on the next tick."""
+        if self._hb_job is not None:
+            self.after_cancel(self._hb_job)
+            self._hb_job = None
+        if self.link.connected:
+            self._hb_job = self.after(100, self.heartbeat)
 
     def stop_heartbeat(self):
         if self._hb_job is not None:
             self.after_cancel(self._hb_job)
             self._hb_job = None
         self._hb_pending = 0
+        self._live_pending = 0
 
     # --- commands ---
 
@@ -910,6 +939,11 @@ class App(tk.Tk):
             # The heartbeat's ack — replies arrive in command order, so the
             # next bare OK after an HB is its own. Dropped, not logged.
             self._hb_pending -= 1
+            return
+        if kind == "status" and self._live_pending > 0:
+            # A live-readback GET: refresh the panels, keep it out of the log.
+            self._live_pending -= 1
+            self.show_status(payload)
             return
         self.log_line(f"< {line}")
         if kind == "event":

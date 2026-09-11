@@ -441,12 +441,20 @@ Pick the port, Connect, and drive each valve from its preset buttons or its
 manual entries. Preset buttons are labelled with both the pressure and the
 command voltage the firmware will program. Each panel also takes a raw
 voltage, sending `V <ch> <volts>` for debugging, and shows the valve's
-**monitor readback** (percent of full scale, or `n/a` for a channel with
-readback disabled) alongside the commanded value.
+**monitor readback** alongside the commanded value: the monitor-pin voltage,
+the percent of full scale, and the pressure derived from that voltage
+(1 V = 0 %, 5 V = 100 % over the panel's calibrated range), e.g.
+`3.118 V  (53.0 %)  ≈ -43.0 kPa`. Below 0.5 V it says `no monitor signal`
+(no valve, rail off, or open line); `n/a` means readback is disabled for
+that channel.
 
-The GUI sends `HB` every second automatically, so the link-loss heartbeat
-stays armed at its default; unplugging the cable or killing the GUI zeroes
-the outputs within ~2 s. `CLEAR` drops one valve back to zero, `ZERO ALL` is
+**Live readback** (checkbox in the connection bar, on by default) polls
+`GET` twice a second and refreshes the panels silently — those polls and
+their replies are kept out of the log, a `GET` you press yourself is still
+logged. The poll doubles as the heartbeat; with the box off the GUI sends
+`HB` every second instead. Either way the link-loss timer stays armed at
+its default, so unplugging the cable or killing the GUI zeroes the outputs
+within ~2 s. `CLEAR` drops one valve back to zero, `ZERO ALL` is
 the panic button (rail stays on), and `ZERO` is sent on window close.
 
 ### Test profiles
