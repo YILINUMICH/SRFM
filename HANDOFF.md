@@ -31,6 +31,17 @@ Assembled SRFMV1 board, XIAO nRF52840 **Sense** (USB VID 0x2886; PID 0x8045 stoc
 | XIAO variant | **Sense** (PID 0x8045 stock). Closes the plain-vs-Sense open item; the IMU is not on D4/D5, no I²C conflict |
 | Bench tip | Send `HBT 0` first when driving the board from a terminal; `CAL DEFAULT` + `CAL SAVE` resets the saved heartbeat to 2 s |
 
+### CH3 after the D9 rework (2026-09-10, later)
+
+D9 reworked on CH3 only. DAC output B then sweeps 0 to 10.15 V with the clamp
+bit never set, and the CMD3 pad tracks the DAC pin with a pure gain error of
+about +0.6 % (2.001 V → 2.016, 4.999 → 5.03, 8.000 → 8.05, 10.001 → 10.06),
+no offset. That is the AD5724R internal-reference tolerance and is absorbed by
+`CAL FS` once measured with the valve attached (nominal 3851 would become
+about 3828 for CH3). Outputs A, C and D still clamp at 0.7 V until D10, D7
+and D8 are reworked the same way. A transient 0.02 V reading on U3 pin 4
+during this work was a probing artefact, not a dead output.
+
 ## 1. What this project is
 
 A control chain for **3 vacuum regulators + 1 air-pressure regulator** from a PC:
