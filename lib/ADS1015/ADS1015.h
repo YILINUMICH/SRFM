@@ -8,8 +8,13 @@ Config register (pointer 0x01), 16-bit big-endian:
   bit 14:12 MUX    100 AIN0  101 AIN1  110 AIN2  111 AIN3  (vs GND)
   bit 11:9  PGA    010 = +/-2.048 V FSR  (1 mV / code)   <- divider design
   bit 8     MODE   1 = single-shot
-  bit 7:5   DR     100 = 1600 SPS (~0.6 ms per conversion)
+  bit 7:5   DR     100 = 1600 SPS (~0.6 ms per conversion, the default)
+                   111 = 3300 SPS (~0.3 ms; used while streaming)
   bit 4:0   00011  comparator disabled (ALERT/RDY is unconnected)
+
+Per conversion the I2C traffic (config write, OS poll, result read) costs
+about as much as the conversion itself, so one single-ended reading is
+~0.7 ms at 1600 SPS and ~0.55 ms at 3300 SPS.
 
 Conversion register (pointer 0x00): 12-bit result left-justified in 16 bits.
 */
@@ -32,10 +37,18 @@ Conversion register (pointer 0x00): 12-bit result left-justified in 16 bits.
 #define ADS1015_CODE_MAX    2047
 #define ADS1015_MV_PER_CODE 1.0f   // at +/-2.048 V FSR
 
+#define ADS1015_DR_1600 4   // config DR field values (bits 7:5)
+#define ADS1015_DR_3300 7
+
 class ADS1015
 {
 public:
   void begin(uint8_t address = ADS1015_ADDR_GND, TwoWire *wire = &Wire);
+
+  //! Conversion rate for subsequent readings: ADS1015_DR_1600 (default) or
+  //! ADS1015_DR_3300. Takes effect on the next conversion.
+  void setDataRate(uint8_t dr) { _dr = (uint8_t)(dr & 0x07); }
+  uint8_t dataRate() const { return _dr; }
 
   //! Write a config with OS = 0 and check the ACK: I2C proof for bring-up.
   bool probe();
@@ -60,6 +73,7 @@ private:
 
   TwoWire *_wire = nullptr;
   uint8_t  _addr = ADS1015_ADDR_GND;
+  uint8_t  _dr   = ADS1015_DR_1600;
 };
 
 #endif  // ADS1015_H

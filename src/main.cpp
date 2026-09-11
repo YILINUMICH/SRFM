@@ -47,6 +47,14 @@ static const uint8_t PIN_EFUSE_FLT  = D7;   // P1.12, 100 k pull-up, open-drain,
 static const uint32_t WDT_TIMEOUT_MS      = 2000;
 static const uint32_t HOUSEKEEP_PERIOD_MS = 100;   // ~10 Hz monitor sweep
 static const uint8_t  ADC_AVERAGE         = 8;     // per channel per sweep
+// STREAM: the monitors are swept and reported at a fixed rate on the
+// board's own clock (host timers are not steady enough above ~20 Hz). The
+// ADS1015 runs at 3300 SPS with 2 conversions averaged: ~4.4 ms for four
+// channels, which fits a 10 ms period with room for the command parser.
+// 200 Hz is accepted but leaves no margin; the monitor front end rolls
+// off around 50 Hz anyway, so 100 Hz already captures what it passes.
+static const uint16_t STREAM_HZ_MAX       = 200;
+static const uint8_t  ADC_AVERAGE_STREAM  = 2;
 static const uint32_t RAIL_SETTLE_MS      = 150;   // eFuse ramps ~90 ms
 static const uint32_t STUCK_HOLD_MS       = 1000;
 static const uint32_t CLEARFAULT_OFF_MS   = 120;   // SHDN low >= 100 ms to clear a latch
@@ -96,6 +104,10 @@ static bool     norailReported = false;
 static uint32_t lastCmdMs = 0;
 static bool     hbArmed = false;        // arms on the first command after boot/START
 static uint32_t lastHousekeepMs = 0;
+
+static uint16_t streamHz = 0;           // 0 = off
+static uint32_t streamPeriodUs = 0;
+static uint32_t streamNextUs = 0;
 
 static char    lineBuf[128];
 static uint8_t lineLen = 0;
@@ -242,7 +254,8 @@ static bool dacBringUp()
   return dacOk;
 }
 
-static void readMonitors();   // fwd
+static void readMonitors(uint8_t average = ADC_AVERAGE);   // fwd
+static void streamSet(uint16_t hz);                         // fwd
 static void evaluateChannels();
 
 //! Steps 11-12: rail on, settle, first monitor sweep. Emits !READY / !FAULT.
@@ -293,7 +306,7 @@ static bool restart()
 }
 
 // --- monitors -------------------------------------------------------------
-static void readMonitors()
+static void readMonitors(uint8_t average)
 {
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++)
   {
@@ -302,7 +315,7 @@ static void readMonitors()
     c.monValid = false;
     if (!k.rbEnabled || !adcOk) continue;
     int16_t code;
-    if (!adc.readAveraged(k.adcInput, ADC_AVERAGE, &code)) continue;
+    if (!adc.readAveraged(k.adcInput, average, &code)) continue;
     c.adcCode = code;
     c.monVolts = PressureControl::adcCodeToMonitorVolts(k, code);
     c.monFrac = PressureControl::monitorVoltsToFraction(c.monVolts);
@@ -399,8 +412,13 @@ static void housekeeping()
     }
   }
 
-  readMonitors();
-  evaluateChannels();
+  // While streaming, the stream tick owns the monitor sweep and the
+  // per-channel checks at its own (higher) rate.
+  if (streamHz == 0)
+  {
+    readMonitors();
+    evaluateChannels();
+  }
 
   // Host link loss.
   uint16_t hb = store.cfg().hbTimeout_s;
@@ -411,6 +429,7 @@ static void housekeeping()
     state = BoardState::FAULT;
     faultReason = FaultReason::LINKLOST;
     hbArmed = false;
+    streamSet(0);   // nobody is listening
     printfln("!FAULT LINKLOST");
   }
 }
@@ -502,12 +521,12 @@ static void cmdId()
            store.calibrated() ? "ok" : "uncal", hb, (unsigned long)resetReason, (unsigned long)bootWord);
 }
 
-static void cmdGetAll()
+//! "VAC1=<p>,<v>V,<mon%>,<monV>V; ...; AIR=..." — the body shared by GET and
+//! the stream lines, appended at reply[pos].
+static size_t formatStatusBody(size_t pos)
 {
   char m[4][20];
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++) monField(i, m[i], sizeof(m[i]));
-  size_t pos = 0;
-  pos += snprintf(reply + pos, sizeof(reply) - pos, "OK ");
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++)
   {
     const ChannelCal &k = cal(i);
@@ -517,7 +536,58 @@ static void cmdGetAll()
                     i < VALVE_NUM_CHANNELS - 1 ? "; " : "");
     if (pos >= sizeof(reply)) break;
   }
+  return pos;
+}
+
+static void cmdGetAll()
+{
+  size_t pos = (size_t)snprintf(reply, sizeof(reply), "OK ");
+  formatStatusBody(pos);
   Serial.println(reply);
+}
+
+// --- streaming --------------------------------------------------------------
+//
+// "~<ms> <GET body>" once per period, timestamped from the board's millisecond
+// clock so the host's timing does not matter. Not a reply to anything: like
+// '!' events it can land between a command and its reply. The ADC runs at
+// 3300 SPS with a short average while the stream is on and goes back to the
+// housekeeping settings when it is off.
+
+static void streamSet(uint16_t hz)
+{
+  if (hz > STREAM_HZ_MAX) hz = STREAM_HZ_MAX;
+  streamHz = hz;
+  if (hz == 0)
+  {
+    adc.setDataRate(ADS1015_DR_1600);
+    return;
+  }
+  adc.setDataRate(ADS1015_DR_3300);
+  streamPeriodUs = 1000000UL / hz;
+  streamNextUs = micros() + streamPeriodUs;
+}
+
+static void streamTick()
+{
+  uint32_t t = millis();
+  readMonitors(ADC_AVERAGE_STREAM);
+  evaluateChannels();
+  size_t pos = (size_t)snprintf(reply, sizeof(reply), "~%lu ", (unsigned long)t);
+  formatStatusBody(pos);
+  Serial.println(reply);
+}
+
+static void streamService()
+{
+  if (streamHz == 0) return;
+  uint32_t now = micros();
+  if ((int32_t)(now - streamNextUs) < 0) return;
+  streamNextUs += streamPeriodUs;
+  // Fell more than a period behind (a long command, a stalled USB write):
+  // resynchronise rather than burst out the missed ticks.
+  if ((int32_t)(now - streamNextUs) >= 0) streamNextUs = now + streamPeriodUs;
+  streamTick();
 }
 
 static void cmdGetOne(uint8_t i)
@@ -540,6 +610,8 @@ static void cmdStatus()
                   store.calibrated() ? "ok" : "uncal", hb);
   if (state == BoardState::FAULT)
     pos += snprintf(reply + pos, sizeof(reply) - pos, " reason=%s", faultName(faultReason));
+  if (streamHz) pos += snprintf(reply + pos, sizeof(reply) - pos, " stream=%u", streamHz);
+  else          pos += snprintf(reply + pos, sizeof(reply) - pos, " stream=off");
   for (uint8_t i = 0; i < VALVE_NUM_CHANNELS; i++)
   {
     char m[12];
@@ -768,6 +840,19 @@ static void handleLine(char *line)
     else printfln("ERR bad channel (1-%u)", VALVE_NUM_CHANNELS);
   }
   else if (strcmp(cmd, "STATUS") == 0) cmdStatus();
+  else if (strcmp(cmd, "STREAM") == 0)
+  {
+    char *a = strtok(nullptr, " \t");
+    if (a != nullptr)
+    {
+      long hz;
+      if (!parseLong(a, &hz) || hz < 0 || hz > STREAM_HZ_MAX)
+      { printfln("ERR usage: STREAM <hz 0-%u> (0 = off)", STREAM_HZ_MAX); return; }
+      streamSet((uint16_t)hz);
+    }
+    if (streamHz == 0) printfln("OK stream=off");
+    else printfln("OK stream=%u avg=%u sps=3300", streamHz, ADC_AVERAGE_STREAM);
+  }
   else if (strcmp(cmd, "ZERO") == 0)
   {
     if (dacOk) zeroAllOutputs();
@@ -1082,5 +1167,6 @@ void loop()
     housekeeping();
     wdtKick();   // only after a successful pass through the main loop
   }
+  streamService();
   delay(1);
 }

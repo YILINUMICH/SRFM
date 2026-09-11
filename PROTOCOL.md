@@ -46,6 +46,7 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 | `CLEARFAULT` | `OK ready` or `FAULT <reason>` | only path that cycles SHDN after an eFuse latch: codes 0, SHDN low ≥100 ms, high, re-check |
 | `HB` | `OK` | heartbeat. Any valid command also counts |
 | `HBT <seconds>` | `OK hb=<s\|off>` | link-loss timeout, 0 = off. Timer arms on the first command after boot. Persist with `CAL SAVE` |
+| `STREAM <hz>` | `OK stream=<hz> avg=2 sps=3300` or `OK stream=off` | 0–200, 0 = off; `STREAM` alone reports. While on, the board emits one `~<ms> <GET body>` line per period on its own clock (§ Stream lines) and its housekeeping sweep hands the monitors and the per-channel checks to the stream tick. Not persisted; cleared by `LINKLOST`. 100 Hz is the intended rate (see FIRMWARE_HANDOFF §4: the monitor front end rolls off ~50 Hz); 200 Hz runs with no timing margin |
 
 ## Calibration (`CAL …`, persisted in internal flash)
 
@@ -92,3 +93,22 @@ Boot ends with an unsolicited `!READY ...` or `!FAULT ...` line (§ Events).
 
 Per-channel faults are reported, not acted on. FLT and LINKLOST run the shutdown
 sequence (codes 0, then rail off).
+
+## Stream lines (unsolicited, prefixed `~`)
+
+While `STREAM <hz>` is on, one line per period:
+
+```
+~<ms> VAC1=<p>,<v>V,<mon>,<monV>V; VAC2=…; VAC3=…; AIR=…
+```
+
+`<ms>` is the board's millisecond clock (`millis()`, wraps after 49.7 days) taken
+at the start of that period's monitor sweep; the body is exactly the `GET` reply
+body. Like `!` events, a stream line can land between a command and its reply,
+so a host reading in lockstep must skip lines starting with `~` (or `!`) while
+waiting for `OK`/`ERR`. Timing is set by the board (`micros()` scheduling, resynchronised
+rather than burst if a tick is missed), so host-side jitter only affects when a line
+is read, never what it says. Also `STATUS` shows `stream=<hz|off>`.
+
+The host still has to keep the link alive: stream lines are output only, and the
+link-loss timer counts commands received. `HB` once a second is enough.

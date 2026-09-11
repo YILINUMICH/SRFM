@@ -1,7 +1,7 @@
 #include "ADS1015.h"
 
-// PGA 010 | single-shot | 1600 SPS | comparator off; OS and MUX are per call.
-static const uint16_t CFG_BASE = 0x0400 | 0x0100 | 0x0080 | 0x0003;
+// PGA 010 | single-shot | comparator off; OS, MUX and DR are filled per call.
+static const uint16_t CFG_BASE = 0x0400 | 0x0100 | 0x0003;
 static const uint16_t CFG_OS   = 0x8000;
 
 void ADS1015::begin(uint8_t address, TwoWire *wire)
@@ -33,16 +33,17 @@ bool ADS1015::readReg(uint8_t reg, uint16_t *value)
 
 bool ADS1015::probe()
 {
-  return writeConfig(CFG_BASE | ((uint16_t)ADS1015_MUX_AIN0 << 12));
+  return writeConfig(CFG_BASE | ((uint16_t)_dr << 5) | ((uint16_t)ADS1015_MUX_AIN0 << 12));
 }
 
 bool ADS1015::readSingle(uint8_t mux, int16_t *code)
 {
   mux = muxCode(mux);
-  if (!writeConfig(CFG_OS | CFG_BASE | ((uint16_t)mux << 12))) return false;
+  if (!writeConfig(CFG_OS | CFG_BASE | ((uint16_t)_dr << 5) | ((uint16_t)mux << 12))) return false;
 
-  // ~0.6 ms at 1600 SPS; poll OS with a hard cap so a wedged bus cannot
-  // stall the housekeeping loop (and with it the watchdog kick).
+  // ~0.6 ms at 1600 SPS, ~0.3 ms at 3300; poll OS with a hard cap so a
+  // wedged bus cannot stall the housekeeping loop (and with it the watchdog
+  // kick).
   uint32_t t0 = micros();
   for (;;)
   {

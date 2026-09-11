@@ -398,6 +398,7 @@ Operating:
 | `STOP` / `START` | codes 0 then rail off / re-run boot steps 8–12 |
 | `CLEARFAULT` | only path that cycles SHDN after an eFuse latch |
 | `HB` / `HBT <s>` | heartbeat / link-loss timeout (0 = off) |
+| `STREAM <hz>` | 0–200, 0 = off: one `~<ms> <GET body>` line per period on the board's clock (`PROTOCOL.md` § Stream lines). 100 Hz is the intended rate |
 | `CAL …` | calibration, below |
 
 Bench: `VERIFY`, `SPIMODE`, `RAW`, `RAWGET`, `ADC`, `RAIL`, `DUMP`, `HANG` —
@@ -446,15 +447,38 @@ the percent of full scale, and the pressure derived from that voltage
 (1 V = 0 %, 5 V = 100 % over the panel's calibrated range), e.g.
 `3.118 V  (53.0 %)  ≈ -43.0 kPa`. Below 0.5 V it says `no monitor signal`
 (no valve, rail off, or open line); `n/a` means readback is disabled for
-that channel.
+that channel. The three readback lines are: **commanded** — the pressure
+setpoint the firmware is holding (from `P`, or back-derived from the code
+after `V`/`C`); **valve** — the 0–10 V command voltage at the valve's input
+pin; **monitor** — what the valve reports back on its 1–5 V monitor pin
+(its own pressure sensor, ±6 % F.S.), shown as volts, % of span, and the
+pressure that voltage means on this channel's calibrated range.
 
-**Live readback** (checkbox in the connection bar, on by default) polls
-`GET` twice a second and refreshes the panels silently — those polls and
-their replies are kept out of the log, a `GET` you press yourself is still
-logged. The poll doubles as the heartbeat; with the box off the GUI sends
-`HB` every second instead. Either way the link-loss timer stays armed at
-its default, so unplugging the cable or killing the GUI zeroes the outputs
-within ~2 s.
+A typed pressure is corrected before it is sent: clamped to the valve's
+set-pressure range (ITV2090 −1.3 … −80 kPa, ITV0030 1 … 500 kPa) and
+rounded to the valve's step (0.1 kPa vacuum, 1 kPa air — SMC rate both at
+0.2 % F.S. sensitivity, so finer input is not a different pressure at the
+valve; the DAC itself resolves ~0.02 / ~0.13 kPa). The entry is rewritten
+with the value actually sent and the panel says what changed and why. The
+step lives in the `REGULATORS` table next to the endpoints.
+
+**Stream 100 Hz** (checkbox in the connection bar, on by default) asks the
+firmware for `STREAM 100`: the board then sends one timestamped sample line
+per 10 ms on its own clock, and the GUI sends `HB` once a second to keep
+the link alive. Every sample goes to the recording and the plot history;
+the panels are redrawn at 10 Hz and the plot at 4 Hz so the display does
+not eat the CPU. If no sample has arrived for 2 s the heartbeat tick
+re-sends `STREAM 100` (a fresh connection, or the board has been through
+`START`); an `ERR` to that means older firmware and the GUI says so once
+and falls back to polling. Sample lines are never logged.
+
+**Live readback** (checkbox, on by default) is the polling fallback used
+when streaming is off or unsupported: `GET` twice a second, panels
+refreshed silently — those polls and their replies are kept out of the log,
+a `GET` you press yourself is still logged. The poll doubles as the
+heartbeat; with both boxes off the GUI sends `HB` every second instead.
+Either way the link-loss timer stays armed at its default, so unplugging
+the cable or killing the GUI zeroes the outputs within ~2 s.
 
 **Live plot…** opens a 2×2 window, one strip chart per channel, showing the
 last 60 s of the command voltage (blue) and the readback (red) on the same
@@ -462,7 +486,26 @@ last 60 s of the command voltage (blue) and the readback (red) on the same
 command range (1 V → 0 V, 5 V → 10 V); the raw monitor voltage is in each
 pane's header, and the red trace is left blank while there is no monitor
 signal. It is fed by the live-readback poll, so it needs that box ticked.
-Plain Tk canvases, no extra dependency. `CLEAR` drops one valve back to zero, `ZERO ALL` is
+Plain Tk canvases, no extra dependency.
+
+**Recording is automatic.** The first status reply after Connect opens
+`data/srfm_<YYYYmmdd>_<HHMMSS>.csv` at the repository root (git-ignored)
+and Disconnect, a lost port, or closing the window closes it; the bottom
+bar shows the file name and row count while it is open. Every sample
+becomes a row — 100 Hz while streaming, 2 Hz when polling — with the
+board's millisecond stamp in `fw_ms` on streamed rows (the clock to use
+for rate work; blank on polled and event rows) and, per channel, the
+commanded pressure, the command voltage, the
+monitor volts, the monitor % of span and the pressure derived from the
+monitor (blank without a signal). Everything that reaches the log
+(commands sent, acks, `ERR`/`FAULT` replies, `!` events, profile step
+markers) is written as its own row with the text in the `event` column,
+so a fault sits next to the readings around it. Columns:
+`time, t_s, fw_ms, VAC1_set_kPa, VAC1_cmd_V, VAC1_mon_V, VAC1_mon_pct,
+VAC1_mon_kPa, … AIR_…, event`. Rows are flushed as written, so a crash
+or a pulled cable keeps everything up to the last reply.
+
+`CLEAR` drops one valve back to zero, `ZERO ALL` is
 the panic button (rail stays on), and `ZERO` is sent on window close.
 
 ### Test profiles

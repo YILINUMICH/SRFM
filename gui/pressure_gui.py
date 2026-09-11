@@ -9,6 +9,7 @@ Requires: pyserial  (pip install -r requirements.txt)
 """
 
 import collections
+import csv
 import json
 import os
 import queue
@@ -16,6 +17,7 @@ import re
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 import serial
@@ -37,6 +39,19 @@ HEARTBEAT_MS = 1000
 # reply refreshes the panels without being logged. The firmware sweeps the
 # monitors at ~10 Hz, so twice a second is plenty for a display.
 LIVE_MS = 500
+# Streaming: with the box ticked the GUI asks the firmware for STREAM lines
+# ("~<ms> <GET body>") at STREAM_HZ on the board's own clock, and sends a
+# plain HB once a second to keep the link alive. The lines feed the panels,
+# the plot and the recording; they are never logged. If no line has arrived
+# for STREAM_STALL_S the tick re-sends STREAM (a fresh connection, or the
+# board has been through START), and an ERR to that means old firmware, in
+# which case the GUI falls back to polling.
+STREAM_HZ = 100
+STREAM_STALL_S = 2.0
+# The panels and the plot are redrawn at most this often while streaming;
+# every sample still goes to the plot history and the recording.
+UI_REFRESH_S = 0.1
+PLOT_REFRESH_S = 0.25
 
 # Delay after opening the port before the first command. The XIAO does not
 # reset when the port opens, so this only has to cover CDC settling.
@@ -48,22 +63,59 @@ CONNECT_SETTLE_MS = 500
 PRESETS_PER_ROW = 3
 
 # One entry per channel CH1..CH4, in channel order (index = ch - 1):
-# (firmware name, display name, pressure at 0V, pressure at 10V, unit, presets)
+# (firmware name, display name, pressure at 0V, pressure at 10V, unit, step, presets)
 #
 # The firmware name is what GET puts before '=' and is used to match a status
 # reply to its panel. The two pressures are in calibration order — pressure at
 # vMin then at vMax, matching the firmware's CAL PRESS endpoints. They are NOT
 # sorted numerically: the vacuum units run from -1.3 kPa at 0V down to
 # -80 kPa at 10V, and showing them in that order is what makes the range
-# readable next to the valve voltage.
+# readable next to the valve voltage. The endpoints are the valves' set-
+# pressure ranges from the SMC catalogue (ITV2090: -1.3 … -80 kPa; ITV0030:
+# 0.001 … 0.5 MPa), so a typed value outside them is clamped.
+#
+# `step` is the setpoint resolution a typed pressure is rounded to. It comes
+# from the valve, not the DAC: the AD5724R has ~3850 codes across 0-10 V
+# (2.6 mV, i.e. 0.02 kPa on a vacuum unit and 0.13 kPa on the air unit), but
+# SMC rate both ITV series at 0.2 % F.S. sensitivity, so anything finer than
+# ~0.16 kPa (ITV2090, 80 kPa span) or 1 kPa (ITV0030, 500 kPa span) is not a
+# different pressure at the valve. 0.1 kPa keeps the -1.3 kPa endpoint exact.
 REGULATORS = [
-    ("VAC1", "Vacuum 1 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
-    ("VAC2", "Vacuum 2 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
-    ("VAC3", "Vacuum 3 (ITV2090)", -1.3, -80.0, "kPa", (-1.3, -10, -20, -40, -60, -80)),
-    ("AIR", "Air pressure (ITV0030)", 1.0, 500.0, "kPa", (1, 50, 100, 200, 350, 500)),
+    ("VAC1", "Vacuum 1 (ITV2090)", -1.3, -80.0, "kPa", 0.1, (-1.3, -10, -20, -40, -60, -80)),
+    ("VAC2", "Vacuum 2 (ITV2090)", -1.3, -80.0, "kPa", 0.1, (-1.3, -10, -20, -40, -60, -80)),
+    ("VAC3", "Vacuum 3 (ITV2090)", -1.3, -80.0, "kPa", 0.1, (-1.3, -10, -20, -40, -60, -80)),
+    ("AIR", "Air pressure (ITV0030)", 1.0, 500.0, "kPa", 1.0, (1, 50, 100, 200, 350, 500)),
 ]
 NUM_CHANNELS = len(REGULATORS)
 STATUS_NAMES = [reg[0] for reg in REGULATORS]
+
+# The valve's monitor pin (its own pressure sensor, reported as a voltage) is
+# 1 V at 0 % and 5 V at 100 % of the valve's span — the same span the 0-10 V
+# command covers. SMC rate it at ±6 % F.S., so it is a sanity check on what
+# the valve is doing, not a measurement to close a loop on. Below 0.5 V there
+# is no valve, no 24 V or an open line (a live valve never reads under 0.76 V).
+MONITOR_V_0, MONITOR_V_100 = 1.0, 5.0
+MONITOR_MIN_V = 0.5
+
+
+def monitor_fraction(volts):
+    """Monitor-pin voltage -> fraction of the valve's span (0 % = 0.0, 100 % = 1.0)."""
+    return (volts - MONITOR_V_0) / (MONITOR_V_100 - MONITOR_V_0)
+
+
+def monitor_pressure(volts, p_at_0v, p_at_10v):
+    """Monitor-pin voltage -> pressure, using the panel's calibration endpoints."""
+    return p_at_0v + (p_at_10v - p_at_0v) * monitor_fraction(volts)
+
+
+def snap_to_step(value, step):
+    """Round a setpoint to the nearest multiple of step, without float dust.
+
+    snap_to_step(-43.567, 0.1) -> -43.6;  snap_to_step(123.4, 1.0) -> 123.0
+    """
+    text = f"{step:g}"
+    decimals = len(text.split(".")[1]) if "." in text else 0
+    return round(round(value / step) * step, decimals)
 
 
 def to_float(text):
@@ -153,13 +205,10 @@ def monitor_text(monitor, p_at_0v, p_at_10v, unit):
         return pct_text
     volts = to_float(volts_text) if volts_text else None
     if volts is not None:
-        if volts < 0.5:
-            # The monitor never sits below 1 V on a live valve (0.76 V at
-            # -6 %); this low means no valve, no 24 V or an open line.
+        if volts < MONITOR_MIN_V:
             return f"{volts:.3f} V  (no monitor signal)"
         # Pressure from the voltage actually measured, not from the rounded %.
-        frac = (volts - 1.0) / 4.0
-        pressure = p_at_0v + (p_at_10v - p_at_0v) * frac
+        pressure = monitor_pressure(volts, p_at_0v, p_at_10v)
         return f"{volts:.3f} V  ({pct:.1f} %)  ≈ {pressure:.1f} {unit}"
     pressure = p_at_0v + (p_at_10v - p_at_0v) * pct / 100.0
     return f"{pct:.1f} % ≈ {pressure:.1f} {unit}"
@@ -170,6 +219,7 @@ def classify_reply(line):
 
     Returns (kind, payload):
       "event"   an unsolicited '!' line (payload: the line)
+      "stream"  a "~<ms> <GET body>" stream line (payload: (ms, status dict))
       "ok"      a bare "OK" — the heartbeat ack, or any bodyless success
       "status"  a GET reply (payload: parse_get_reply()'s dict)
       "ack"     a single-command ack that changed an output; follow with GET
@@ -177,6 +227,13 @@ def classify_reply(line):
     """
     if line.startswith("!"):
         return "event", line
+    if line.startswith("~"):
+        stamp, _sep, body = line[1:].partition(" ")
+        ms = to_float(stamp)
+        status = parse_get_reply(body)
+        if ms is None or not status:
+            return "log", None   # a garbled stream line: show it rather than drop it
+        return "stream", (int(ms), status)
     if line == "OK":
         return "ok", None
     if not line.startswith("OK "):
@@ -278,7 +335,7 @@ def _validate_step(step, i):
         if "reg" in entry:
             reg = _require_channel(entry["reg"], where, "reg")
             value = _require_number(entry.get("kPa"), where, "kPa")
-            _, _, p_at_0v, p_at_10v, unit, _ = REGULATORS[reg - 1]
+            _, _, p_at_0v, p_at_10v, unit, _, _ = REGULATORS[reg - 1]
             lo, hi = min(p_at_0v, p_at_10v), max(p_at_0v, p_at_10v)
             if not lo <= value <= hi:
                 raise ValueError(
@@ -391,7 +448,7 @@ class SerialLink:
 class RegulatorPanel(ttk.LabelFrame):
     """One regulator: presets, manual pressure, manual voltage, readback."""
 
-    def __init__(self, master, channel, name, p_at_0v, p_at_10v, unit,
+    def __init__(self, master, channel, name, p_at_0v, p_at_10v, unit, step,
                  presets, on_set_pressure, on_set_voltage):
         super().__init__(master, text=f" CH{channel}  {name} ")
         self.channel = channel
@@ -400,6 +457,7 @@ class RegulatorPanel(ttk.LabelFrame):
         self.p_at_10v = p_at_10v
         self.p_lo = min(p_at_0v, p_at_10v)
         self.p_hi = max(p_at_0v, p_at_10v)
+        self.step = step
         self.on_set_pressure = on_set_pressure
         self.on_set_voltage = on_set_voltage
 
@@ -409,8 +467,9 @@ class RegulatorPanel(ttk.LabelFrame):
         # panel about a quarter of the window wide.
         ttk.Label(
             self,
-            text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}\n"
-                  f"Valve    {VOLT_MIN:g} … {VOLT_MAX:g} V"),
+            text=(f"Range    {p_at_0v:g} … {p_at_10v:g} {unit}   step {step:g}\n"
+                  f"Valve    {VOLT_MIN:g} … {VOLT_MAX:g} V  (command in)\n"
+                  f"Monitor  {MONITOR_V_0:g} … {MONITOR_V_100:g} V  (readback out, ±6 %)"),
             justify="left",
         ).grid(row=0, column=0, columnspan=5, padx=10, pady=(6, 4), sticky="w")
 
@@ -496,8 +555,20 @@ class RegulatorPanel(ttk.LabelFrame):
         self.warn()
         return value
 
-    def apply_pressure(self, value):
-        value = self.clamp(value, self.p_lo, self.p_hi, self.unit)
+    def apply_pressure(self, requested):
+        """Clamp to the valve's range, round to its step, then send.
+
+        Whatever was typed, the entry is rewritten with the value actually
+        sent, and the panel says why it changed: 'clamped' beats 'rounded'
+        when both apply, since being out of range is the thing to know.
+        """
+        clamped = self.clamp(requested, self.p_lo, self.p_hi, self.unit)
+        # The endpoints are on the step grid, but keep the clamp regardless so
+        # a future table edit cannot let rounding push past the range.
+        value = min(max(snap_to_step(clamped, self.step), self.p_lo), self.p_hi)
+        if value != clamped and clamped == requested:
+            self.warn(f"{requested:g} rounded to {value:g} {self.unit} — "
+                      f"the valve resolves {self.step:g} {self.unit}")
         self.p_entry.delete(0, "end")
         self.p_entry.insert(0, f"{value:g}")
         self.on_set_pressure(self.channel, value)
@@ -645,7 +716,7 @@ class ProfileRunner:
 # last PLOT_WINDOW_S seconds.
 
 PLOT_WINDOW_S = 60
-PLOT_HISTORY = 4 * PLOT_WINDOW_S   # points kept per channel (>= window at 2 Hz)
+PLOT_HISTORY = STREAM_HZ * PLOT_WINDOW_S   # points kept per channel (>= window when streaming)
 
 
 class PlotPane(tk.Frame):
@@ -749,7 +820,7 @@ class LivePlotWindow(tk.Toplevel):
         self.title("SRFM live plot - command vs readback (0-10 V scale)")
         self.resizable(False, False)
         self.panes = {}
-        for i, (fw_name, name, _p0, _p10, _unit, _presets) in enumerate(REGULATORS):
+        for i, (fw_name, name, *_rest) in enumerate(REGULATORS):
             pane = PlotPane(self, f"CH{i + 1}  {name}")
             pane.grid(row=i // 2, column=i % 2, padx=4, pady=4)
             self.panes[fw_name] = pane
@@ -764,6 +835,82 @@ class LivePlotWindow(tk.Toplevel):
     def close(self):
         self.app.plot_window = None
         self.destroy()
+
+
+# --- data recording --------------------------------------------------------
+#
+# Every connection is recorded, without anything to press: the first status
+# reply after Connect opens data/srfm_<date>_<time>.csv and Disconnect (or a
+# lost port, or closing the window) closes it. Every status reply is a row:
+# with live readback on that is one every LIVE_MS, plus a row for each GET
+# pressed by hand. Everything that reaches the log — commands sent, acks,
+# ERR/FAULT replies, '!' events, profile step markers — goes in as its own
+# row with the channel columns empty and the text in `event`, so a fault or
+# a setpoint change sits in the record next to the readings around it. Rows
+# are flushed as written: a crash or a yanked cable keeps everything up to
+# the last reply.
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+
+class Recorder:
+    """One CSV file; one row per status reply or logged line."""
+
+    # Per channel: commanded pressure, command voltage, monitor volts, monitor
+    # % F.S., pressure derived from the monitor volts (blank without a signal).
+    FIELDS = ("set_{unit}", "cmd_V", "mon_V", "mon_pct", "mon_{unit}")
+
+    def __init__(self, path):
+        self.path = path
+        self.rows = 0
+        self.t0 = time.monotonic()
+        self._file = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        # fw_ms is the board's millisecond clock on stream lines (the timing to
+        # trust for rate work); blank on polled GET rows and event rows.
+        header = ["time", "t_s", "fw_ms"]
+        for fw_name, _name, _p0, _p10, unit, _step, _presets in REGULATORS:
+            header += [f"{fw_name}_{field.format(unit=unit)}" for field in self.FIELDS]
+        header.append("event")
+        self._write(header)
+        self.rows = 0
+
+    def _stamp(self, fw_ms=None):
+        return [datetime.now().isoformat(sep=" ", timespec="milliseconds"),
+                f"{time.monotonic() - self.t0:.3f}",
+                "" if fw_ms is None else str(fw_ms)]
+
+    def write_status(self, status, fw_ms=None):
+        """One row from a parse_get_reply() dict; missing channels stay blank."""
+        row = self._stamp(fw_ms)
+        for fw_name, _name, p_at_0v, p_at_10v, _unit, _step, _presets in REGULATORS:
+            if fw_name not in status:
+                row += [""] * len(self.FIELDS)
+                continue
+            pressure, volts, monitor = status[fw_name]
+            pct_text, volts_text = monitor if isinstance(monitor, tuple) else (monitor, None)
+            mon_v = to_float(volts_text) if volts_text else None
+            mon_pct = to_float((pct_text or "").rstrip("%"))
+            mon_p = ""
+            if mon_v is not None and mon_v >= MONITOR_MIN_V:
+                mon_p = f"{monitor_pressure(mon_v, p_at_0v, p_at_10v):.2f}"
+            row += [pressure, volts,
+                    "" if mon_v is None else f"{mon_v:.3f}",
+                    "" if mon_pct is None else f"{mon_pct:.1f}",
+                    mon_p]
+        row.append("")
+        self._write(row)
+
+    def write_event(self, text):
+        self._write(self._stamp() + [""] * (len(self.FIELDS) * NUM_CHANNELS) + [text])
+
+    def _write(self, row):
+        self._writer.writerow(row)
+        self._file.flush()
+        self.rows += 1
+
+    def close(self):
+        self._file.close()
 
 
 class App(tk.Tk):
@@ -787,6 +934,15 @@ class App(tk.Tk):
         # from every status reply, for the live plot window.
         self.history = {reg[0]: collections.deque(maxlen=PLOT_HISTORY) for reg in REGULATORS}
         self.plot_window = None
+        self.recorder = None
+        self._record_failed = False  # one warning per connection, not per reply
+        # Streaming: STREAM replies still to arrive, whether this firmware
+        # refused STREAM, when the last '~' line came, and the UI throttles.
+        self._stream_pending = 0
+        self._stream_unsupported = False
+        self._last_stream_t = 0.0
+        self._ui_due = 0.0
+        self._plot_due = 0.0
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -807,12 +963,15 @@ class App(tk.Tk):
         self.live_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Live readback", variable=self.live_var,
                         command=self.restart_heartbeat).pack(side="right", padx=6)
+        self.stream_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text=f"Stream {STREAM_HZ} Hz", variable=self.stream_var,
+                        command=self.toggle_stream).pack(side="right", padx=6)
 
         # --- regulator panels, one per column, in channel order ---
         self.panels = {}
-        for i, (fw_name, name, p_at_0v, p_at_10v, unit, presets) in enumerate(REGULATORS):
-            panel = RegulatorPanel(self, i + 1, name, p_at_0v, p_at_10v, unit, presets,
-                                   self.set_pressure, self.set_voltage)
+        for i, (fw_name, name, p_at_0v, p_at_10v, unit, step, presets) in enumerate(REGULATORS):
+            panel = RegulatorPanel(self, i + 1, name, p_at_0v, p_at_10v, unit, step,
+                                   presets, self.set_pressure, self.set_voltage)
             panel.grid(row=1, column=i, padx=(8 if i == 0 else 4, 8), pady=4,
                        sticky="nsew")
             self.panels[fw_name] = panel
@@ -837,6 +996,9 @@ class App(tk.Tk):
             side="left", padx=(6, 0))
         ttk.Button(bottom, text="Live plot…", command=self.open_live_plot).pack(
             side="left", padx=(18, 0))
+        # Recording is automatic (see DATA_DIR); this only shows where it goes.
+        self.record_label = ttk.Label(bottom, text="", foreground="#a00")
+        self.record_label.pack(side="left", padx=(18, 0))
 
         # --- test profile bar ---
         script = ttk.LabelFrame(self, text=" Test profile ")
@@ -891,6 +1053,10 @@ class App(tk.Tk):
         self.after(CONNECT_SETTLE_MS + 200, lambda: self.send_if_connected("GET"))
         self._hb_pending = 0
         self._live_pending = 0
+        self._record_failed = False
+        self._stream_pending = 0
+        self._stream_unsupported = False
+        self._last_stream_t = 0.0
         self._hb_job = self.after(HEARTBEAT_MS, self.heartbeat)
 
     def disconnect_link(self, reason):
@@ -900,10 +1066,19 @@ class App(tk.Tk):
         # close; it would keep ticking and log a send failure per step.
         if self.runner is not None:
             self.runner.stop(f"stopped — {reason}")
+        # Leave the board quiet; without this it streams into a closed port
+        # until its link-loss timer fires.
+        if self.link.connected and self._last_stream_t:
+            try:
+                self.link.send("STREAM 0")
+            except (RuntimeError, serial.SerialException):
+                pass
         self.link.disconnect()
         self.status.config(text="disconnected", foreground="#a00")
         self.board.config(text="", foreground="#444")
         self.connect_btn.config(text="Connect")
+        self.log_line(f"# {reason}")
+        self.stop_recording(f"stopped — {reason}")
 
     def on_close(self):
         if self.runner is not None:
@@ -915,7 +1090,38 @@ class App(tk.Tk):
             except (RuntimeError, serial.SerialException):
                 pass
             self.link.disconnect()
+        self.stop_recording("stopped — window closed")
         self.destroy()
+
+    # --- data recording ---
+
+    def start_recording(self):
+        """Open a new timestamped CSV in DATA_DIR; called on the first status
+        reply of a connection. A file that cannot be opened is reported once
+        and the session carries on unrecorded rather than refusing to run."""
+        path = os.path.join(DATA_DIR, time.strftime("srfm_%Y%m%d_%H%M%S.csv"))
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            self.recorder = Recorder(path)
+        except OSError as exc:
+            self.log_line(f"! recording disabled: cannot write {path}: {exc}")
+            self._record_failed = True
+            return
+        self.log_line(f"# recording to {path}")
+        self.show_record_progress()
+
+    def stop_recording(self, reason):
+        if self.recorder is None:
+            return
+        self.log_line(f"# recording {reason}")
+        self.recorder.close()
+        self.recorder = None
+        self.record_label.config(text="")
+
+    def show_record_progress(self):
+        if self.recorder is not None:
+            self.record_label.config(
+                text=f"● {os.path.basename(self.recorder.path)}  {self.recorder.rows} rows")
 
     # --- heartbeat ---
 
@@ -931,14 +1137,25 @@ class App(tk.Tk):
         self._hb_job = None
         if not self.link.connected:
             return
-        live = bool(self.live_var.get())
+        stream = bool(self.stream_var.get()) and not self._stream_unsupported
+        live = bool(self.live_var.get()) and not stream
+        if stream:
+            # Stream lines carry the data; the tick only has to keep the link
+            # alive — unless the stream has gone quiet, in which case ask for
+            # it (again). Either line satisfies the firmware's timer.
+            stalled = time.monotonic() - self._last_stream_t > STREAM_STALL_S
+            cmd = f"STREAM {STREAM_HZ}" if stalled else "HB"
+        else:
+            cmd = "GET" if live else "HB"
         try:
-            self.link.send("GET" if live else "HB")
+            self.link.send(cmd)
         except (RuntimeError, serial.SerialException) as exc:
             self.log_line(f"! heartbeat failed: {exc}")
             self.disconnect_link("port lost")
             return
-        if live:
+        if cmd.startswith("STREAM"):
+            self._stream_pending += 1
+        elif cmd == "GET":
             self._live_pending += 1
         else:
             self._hb_pending += 1
@@ -952,12 +1169,23 @@ class App(tk.Tk):
         if self.link.connected:
             self._hb_job = self.after(100, self.heartbeat)
 
+    def toggle_stream(self):
+        """Stream checkbox toggled. Off: tell the board now, and forget the
+        last stream time so a later re-tick asks afresh. On: the next tick
+        sees a stalled stream and sends STREAM."""
+        if not self.stream_var.get() and self.link.connected and self._last_stream_t:
+            self.send_cmd("STREAM 0")
+        self._last_stream_t = 0.0
+        self._stream_unsupported = False
+        self.restart_heartbeat()
+
     def stop_heartbeat(self):
         if self._hb_job is not None:
             self.after_cancel(self._hb_job)
             self._hb_job = None
         self._hb_pending = 0
         self._live_pending = 0
+        self._stream_pending = 0
 
     # --- commands ---
 
@@ -1075,6 +1303,12 @@ class App(tk.Tk):
 
     def handle_line(self, line):
         kind, payload = classify_reply(line)
+        if kind == "stream":
+            # One sample on the board's clock: never logged, always recorded.
+            self._last_stream_t = time.monotonic()
+            ms, status = payload
+            self.show_status(status, fw_ms=ms)
+            return
         if kind == "ok" and self._hb_pending > 0:
             # The heartbeat's ack — replies arrive in command order, so the
             # next bare OK after an HB is its own. Dropped, not logged.
@@ -1085,7 +1319,22 @@ class App(tk.Tk):
             self._live_pending -= 1
             self.show_status(payload)
             return
-        self.log_line(f"< {line}")
+        if kind == "log" and self._stream_pending > 0:
+            if line.startswith("OK stream="):
+                # The tick's own STREAM request: acknowledged quietly.
+                self._stream_pending -= 1
+                return
+            if line.startswith("ERR"):
+                # Firmware without STREAM: say so once, fall back to polling.
+                self._stream_pending = 0
+                self._stream_unsupported = True
+                self.log_line(f"< {line}")
+                self.log_line("! this firmware has no STREAM — polling GET instead")
+                self.restart_heartbeat()
+                return
+        # A status reply is recorded as a numeric row by show_status, not as
+        # an event line as well.
+        self.log_line(f"< {line}", record=kind != "status")
         if kind == "event":
             self.show_event(line)
         elif kind == "ack":
@@ -1097,17 +1346,32 @@ class App(tk.Tk):
             if state:
                 self.show_state(state)
 
-    def show_status(self, status):
+    def show_status(self, status, fw_ms=None):
+        """Apply one status (a GET reply, or a stream sample with the board's
+        millisecond stamp). Every sample goes to the plot history and the
+        recording; the panels and the plot are redrawn at a display rate,
+        which at STREAM_HZ would otherwise be the whole CPU budget."""
         t_now = time.monotonic()
-        for name, (pressure, volts, monitor) in status.items():
-            self.panels[name].show_readback(pressure, volts, monitor)
+        for name, (_pressure, volts, monitor) in status.items():
             self.record_sample(name, volts, monitor, t_now)
-        if self.plot_window is not None:
+        # First data of a connection starts the file; nothing to press.
+        if self.recorder is None and self.link.connected and not self._record_failed:
+            self.start_recording()
+        if self.recorder is not None:
+            self.recorder.write_status(status, fw_ms)
+
+        if fw_ms is None or t_now >= self._ui_due:
+            self._ui_due = t_now + UI_REFRESH_S
+            for name, (pressure, volts, monitor) in status.items():
+                self.panels[name].show_readback(pressure, volts, monitor)
+            self.show_record_progress()
+        if self.plot_window is not None and (fw_ms is None or t_now >= self._plot_due):
+            self._plot_due = t_now + PLOT_REFRESH_S
             self.plot_window.refresh()
 
     def record_sample(self, name, volts, monitor, t_now):
         """Append one plot sample: command V and the readback on the same
-        0-10 V scale ((Vmon - 1) / 4 * 10); no readback below 0.5 V."""
+        0-10 V scale (monitor fraction x 10 V); no readback without a signal."""
         cmd = to_float(volts)
         if cmd is None:
             return
@@ -1115,8 +1379,8 @@ class App(tk.Tk):
         if isinstance(monitor, tuple) and monitor[1]:
             mon_v = to_float(monitor[1])
         rb = None
-        if mon_v is not None and mon_v >= 0.5:
-            rb = (mon_v - 1.0) / 4.0 * 10.0
+        if mon_v is not None and mon_v >= MONITOR_MIN_V:
+            rb = monitor_fraction(mon_v) * VOLT_MAX
         self.history[name].append((t_now, cmd, rb, mon_v))
 
     def open_live_plot(self):
@@ -1137,11 +1401,15 @@ class App(tk.Tk):
         colour = "#080" if state == "READY" else "#a00"
         self.board.config(text=f"state {state}", foreground=colour)
 
-    def log_line(self, text):
+    def log_line(self, text, record=True):
+        """Append to the log; while recording, also to the CSV's event column."""
         self.log.config(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
+        if record and self.recorder is not None:
+            self.recorder.write_event(text)
+            self.show_record_progress()
 
 
 if __name__ == "__main__":
