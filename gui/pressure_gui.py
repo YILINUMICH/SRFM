@@ -8,6 +8,7 @@ command — see PROTOCOL.md at the repository root.
 Requires: pyserial  (pip install -r requirements.txt)
 """
 
+import collections
 import json
 import os
 import queue
@@ -632,6 +633,139 @@ class ProfileRunner:
         self.job = self.app.after(self.TICK_MS, self._tick)
 
 
+
+# --- live plot -------------------------------------------------------------
+#
+# A 2x2 strip chart, one pane per channel, drawn on plain Tk canvases so the
+# GUI keeps its single dependency (pyserial). Each pane shows the command
+# voltage and the readback expressed on the same 0-10 V scale: the valve's
+# monitor pin runs 1 V (0 %) to 5 V (100 %), so readback_eq = (Vmon - 1) / 4
+# * 10. The raw monitor voltage is shown in the pane's header. Data arrives
+# from the live-readback GET replies (twice a second); the window keeps the
+# last PLOT_WINDOW_S seconds.
+
+PLOT_WINDOW_S = 60
+PLOT_HISTORY = 4 * PLOT_WINDOW_S   # points kept per channel (>= window at 2 Hz)
+
+
+class PlotPane(tk.Frame):
+    """One channel's strip chart."""
+
+    W, H = 360, 210
+    LEFT, RIGHT, TOP, BOTTOM = 34, 10, 22, 22   # margins for axes/labels
+    Y_MAX = 10.0
+
+    def __init__(self, master, title):
+        super().__init__(master)
+        self.title = title
+        self.header = ttk.Label(self, text=title, font=("TkDefaultFont", 9, "bold"))
+        self.header.pack(anchor="w", padx=4)
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H, bg="white",
+                                highlightthickness=1, highlightbackground="#bbb")
+        self.canvas.pack(padx=4, pady=(0, 4))
+
+    def _x(self, t, t_now):
+        span = self.W - self.LEFT - self.RIGHT
+        return self.LEFT + span * (1.0 - (t_now - t) / PLOT_WINDOW_S)
+
+    def _y(self, v):
+        span = self.H - self.TOP - self.BOTTOM
+        v = min(max(v, 0.0), self.Y_MAX)
+        return self.TOP + span * (1.0 - v / self.Y_MAX)
+
+    def draw(self, samples, t_now):
+        """samples: iterable of (t, cmd_volts, readback_eq_volts or None, monitor_volts or None)."""
+        c = self.canvas
+        c.delete("all")
+        # axes + grid
+        for v in (0, 2, 4, 6, 8, 10):
+            y = self._y(v)
+            c.create_line(self.LEFT, y, self.W - self.RIGHT, y, fill="#e6e6e6")
+            c.create_text(self.LEFT - 4, y, text=f"{v}", anchor="e", fill="#666",
+                          font=("TkDefaultFont", 8))
+        for sec in range(0, PLOT_WINDOW_S + 1, 10):
+            x = self._x(t_now - sec, t_now)
+            c.create_line(x, self.TOP, x, self.H - self.BOTTOM, fill="#eeeeee")
+            c.create_text(x, self.H - self.BOTTOM + 4, text=f"-{sec}s" if sec else "now",
+                          anchor="n", fill="#666", font=("TkDefaultFont", 8))
+        c.create_rectangle(self.LEFT, self.TOP, self.W - self.RIGHT, self.H - self.BOTTOM,
+                           outline="#999")
+        c.create_text(self.LEFT + 4, self.TOP - 12, text="V", anchor="w", fill="#666",
+                      font=("TkDefaultFont", 8))
+
+        cmd_pts, rb_pts, rb_segments = [], [], []
+        last = None
+        for t, cmd, rb, mon in samples:
+            if t_now - t > PLOT_WINDOW_S:
+                continue
+            x = self._x(t, t_now)
+            cmd_pts += [x, self._y(cmd)]
+            if rb is None:
+                if rb_pts:
+                    rb_segments.append(rb_pts)
+                    rb_pts = []
+            else:
+                rb_pts += [x, self._y(rb)]
+            last = (cmd, rb, mon)
+        if rb_pts:
+            rb_segments.append(rb_pts)
+        for seg in rb_segments:
+            if len(seg) >= 4:
+                c.create_line(*seg, fill="#c62828", width=2)
+            elif len(seg) == 2:
+                c.create_oval(seg[0] - 2, seg[1] - 2, seg[0] + 2, seg[1] + 2,
+                              fill="#c62828", outline="")
+        if len(cmd_pts) >= 4:
+            c.create_line(*cmd_pts, fill="#1565c0", width=2)
+        elif len(cmd_pts) == 2:
+            c.create_oval(cmd_pts[0] - 2, cmd_pts[1] - 2, cmd_pts[0] + 2, cmd_pts[1] + 2,
+                          fill="#1565c0", outline="")
+
+        # header carries the latest values; a small legend sits in the plot
+        if last is None:
+            self.header.config(text=f"{self.title}   -   no data")
+        else:
+            cmd, rb, mon = last
+            if rb is not None:
+                rb_txt = f"readback {rb:.2f} V  (monitor {mon:.3f} V)"
+            else:
+                rb_txt = "readback: no monitor signal"
+            self.header.config(text=f"{self.title}   command {cmd:.2f} V   {rb_txt}")
+        x0 = self.W - self.RIGHT - 150
+        c.create_line(x0, self.TOP + 8, x0 + 20, self.TOP + 8, fill="#1565c0", width=2)
+        c.create_text(x0 + 24, self.TOP + 8, text="command", anchor="w", fill="#333",
+                      font=("TkDefaultFont", 8))
+        c.create_line(x0 + 80, self.TOP + 8, x0 + 100, self.TOP + 8, fill="#c62828", width=2)
+        c.create_text(x0 + 104, self.TOP + 8, text="readback", anchor="w", fill="#333",
+                      font=("TkDefaultFont", 8))
+
+
+class LivePlotWindow(tk.Toplevel):
+    """2x2 pop-up: command vs readback voltage per channel, last 60 s."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("SRFM live plot - command vs readback (0-10 V scale)")
+        self.resizable(False, False)
+        self.panes = {}
+        for i, (fw_name, name, _p0, _p10, _unit, _presets) in enumerate(REGULATORS):
+            pane = PlotPane(self, f"CH{i + 1}  {name}")
+            pane.grid(row=i // 2, column=i % 2, padx=4, pady=4)
+            self.panes[fw_name] = pane
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh()
+
+    def refresh(self):
+        t_now = time.monotonic()
+        for fw_name, pane in self.panes.items():
+            pane.draw(self.app.history[fw_name], t_now)
+
+    def close(self):
+        self.app.plot_window = None
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -649,6 +783,10 @@ class App(tk.Tk):
         self._hb_job = None
         self._hb_pending = 0  # HB acks still to arrive (and be dropped from the log)
         self._live_pending = 0  # periodic GET replies still to arrive (applied, not logged)
+        # Per-channel (t, command V, readback-equivalent V, monitor V) samples
+        # from every status reply, for the live plot window.
+        self.history = {reg[0]: collections.deque(maxlen=PLOT_HISTORY) for reg in REGULATORS}
+        self.plot_window = None
 
         # --- connection bar ---
         bar = ttk.Frame(self)
@@ -697,6 +835,8 @@ class App(tk.Tk):
         ttk.Button(bottom, text="CLEARFAULT",
                    command=lambda: self.send_cmd("CLEARFAULT")).pack(
             side="left", padx=(6, 0))
+        ttk.Button(bottom, text="Live plot…", command=self.open_live_plot).pack(
+            side="left", padx=(18, 0))
 
         # --- test profile bar ---
         script = ttk.LabelFrame(self, text=" Test profile ")
@@ -958,8 +1098,32 @@ class App(tk.Tk):
                 self.show_state(state)
 
     def show_status(self, status):
+        t_now = time.monotonic()
         for name, (pressure, volts, monitor) in status.items():
             self.panels[name].show_readback(pressure, volts, monitor)
+            self.record_sample(name, volts, monitor, t_now)
+        if self.plot_window is not None:
+            self.plot_window.refresh()
+
+    def record_sample(self, name, volts, monitor, t_now):
+        """Append one plot sample: command V and the readback on the same
+        0-10 V scale ((Vmon - 1) / 4 * 10); no readback below 0.5 V."""
+        cmd = to_float(volts)
+        if cmd is None:
+            return
+        mon_v = None
+        if isinstance(monitor, tuple) and monitor[1]:
+            mon_v = to_float(monitor[1])
+        rb = None
+        if mon_v is not None and mon_v >= 0.5:
+            rb = (mon_v - 1.0) / 4.0 * 10.0
+        self.history[name].append((t_now, cmd, rb, mon_v))
+
+    def open_live_plot(self):
+        if self.plot_window is None:
+            self.plot_window = LivePlotWindow(self)
+        else:
+            self.plot_window.lift()
 
     def show_event(self, line):
         """Keep the latest !FAULT / !READY line in the bar; other events log only."""

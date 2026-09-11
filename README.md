@@ -454,7 +454,15 @@ their replies are kept out of the log, a `GET` you press yourself is still
 logged. The poll doubles as the heartbeat; with the box off the GUI sends
 `HB` every second instead. Either way the link-loss timer stays armed at
 its default, so unplugging the cable or killing the GUI zeroes the outputs
-within ~2 s. `CLEAR` drops one valve back to zero, `ZERO ALL` is
+within ~2 s.
+
+**Live plot…** opens a 2×2 window, one strip chart per channel, showing the
+last 60 s of the command voltage (blue) and the readback (red) on the same
+0–10 V scale. The readback is the valve's monitor pin mapped onto the
+command range (1 V → 0 V, 5 V → 10 V); the raw monitor voltage is in each
+pane's header, and the red trace is left blank while there is no monitor
+signal. It is fed by the live-readback poll, so it needs that box ticked.
+Plain Tk canvases, no extra dependency. `CLEAR` drops one valve back to zero, `ZERO ALL` is
 the panic button (rail stays on), and `ZERO` is sent on window close.
 
 ### Test profiles
